@@ -37,6 +37,18 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// Integer index matching the Python `snes65816` mode constants
+    /// (`range(22)` ordering) — used for the differential-oracle JSON.
+    pub fn index(self) -> u8 {
+        use Mode::*;
+        match self {
+            Imp => 0, Acc => 1, Imm => 2, Dp => 3, DpX => 4, DpY => 5,
+            Abs => 6, AbsX => 7, AbsY => 8, Long => 9, LongX => 10, Rel => 11,
+            Rel16 => 12, Stk => 13, Indir => 14, IndirX => 15, IndirY => 16,
+            IndirLy => 17, IndirL => 18, IndirDpx => 19, DpIndir => 20, StkIy => 21,
+        }
+    }
+
     /// The Python `MODE_STR` rendering.
     pub fn as_str(self) -> &'static str {
         use Mode::*;

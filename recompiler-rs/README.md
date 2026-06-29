@@ -34,8 +34,12 @@ cargo test
 Porting in phases (bottom-up, each gated by ported tests):
 
 - [x] Phase 0 — workspace scaffold + golden oracle
-- [ ] Phase 1 — foundations (rom, cfg, ir, widths, cycles)
-- [ ] Phase 2 — decoder + CFG build
+- [x] Phase 1 — foundations (rom, insn, ir, widths, cycles, cfg) — parses all 43
+  SF cfgs, matches the Python loader exactly (1486 entries)
+- [~] Phase 2 — decoder + CFG build. Type contract + `DecodeEnv` fixed; the
+  differential oracle (`scripts/dump_decode.py` → `golden/decode.json`, 1486
+  reference graphs) is built. The `decode_function` body is in progress, gated
+  on exact graph equality vs the oracle.
 - [ ] Phase 3 — lowering + codegen + emit
 - [ ] Phase 4 — autoroute passes
 - [ ] Phase 5 — orchestrator + funcs.h
