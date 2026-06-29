@@ -24,3 +24,6 @@ pub mod decoder;
 
 // Phase 3 — CFG build + lowering + codegen + emit.
 pub mod cfgbuild;
+pub mod codegen;
+pub mod emit;
+pub mod lowering;
