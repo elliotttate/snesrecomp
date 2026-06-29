@@ -1,0 +1,27 @@
+[package]
+name = "snesrecomp-regen"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the snesrecomp v2 static recompiler (regen pipeline)"
+license = "MIT"
+
+[lib]
+name = "snesrecomp_regen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "regen"
+path = "src/bin/regen.rs"
+
+[[bin]]
+name = "sync-funcs-h"
+path = "src/bin/sync_funcs_h.rs"
+
+[dependencies]
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]

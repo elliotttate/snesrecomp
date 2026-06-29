@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+# Leaked-source / ROM-derived golden snapshots stay local-only.
+/golden/
+*.sfc
+*.smc
