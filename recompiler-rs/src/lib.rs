@@ -23,6 +23,7 @@ pub mod widths;
 pub mod decoder;
 
 // Phase 3 — CFG build + lowering + codegen + emit.
+pub mod autoroute;
 pub mod cfgbuild;
 pub mod codegen;
 pub mod emit;
