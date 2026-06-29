@@ -11,11 +11,12 @@
 //! Ordering that reaches output is normalized via sorting / `BTreeMap` rather
 //! than replicating CPython's `set`-iteration quirks.
 
-// Phase 1 — foundations (pure, no cross-module coupling).
-// pub mod rom;
-// pub mod cfg;
-// pub mod ir;
-// pub mod widths;
-// pub mod cycles;
+// Phase 1 — foundations.
+pub mod cfg;
+pub mod cycles;
+pub mod insn;
+pub mod ir;
+pub mod rom;
+pub mod widths;
 
 // Phase 2+ modules land here as they are ported.
