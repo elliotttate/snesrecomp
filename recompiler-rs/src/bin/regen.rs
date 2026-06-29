@@ -679,6 +679,9 @@ fn discover_variants_from_current_entries(
                 ne.end = base.end;
                 ne.entry_m = em;
                 ne.entry_x = ex;
+                // NOTE: variant clones do NOT inherit force_host_return_sites — the
+                // Python clone (v2_regen) builds a fresh BankEntry without it, so
+                // only the canonical (cfg-declared) variant host-returns.
                 cfg.entries.push(ne);
                 current_keys.insert(key);
                 added += 1;
@@ -745,6 +748,7 @@ fn autopromote_targets(
                 ne.end = base.end;
                 ne.entry_m = em;
                 ne.entry_x = ex;
+                // (no force_host_return_sites on clones — matches the Python clone)
                 ne
             } else {
                 let synth = format!("bank_{bank:02X}_{pc:04X}");
@@ -784,6 +788,7 @@ fn bank_entry_to_spec(e: &BankEntry) -> BankEntrySpec {
         entry_x: e.entry_x,
         tail_call_pc16: e.tail_call_pc16,
         entry_s_offset: e.entry_s_offset,
+        force_host_return_sites: e.force_host_return_sites.clone(),
     }
 }
 

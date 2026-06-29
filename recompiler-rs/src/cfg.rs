@@ -28,6 +28,9 @@ pub struct BankEntry {
     pub force_variants: Option<Vec<(u8, u8)>>, // extra (m,x) pairs to force-generate
     pub exit_mx: Option<(u8, u8)>,             // callee-exit (m,x) override
     pub inline_skip: Option<i32>,              // JSR-inline-param skip bytes
+    /// cfg `force_host_return:<hex>[,<hex>]` — RTS/RTL SITE addresses (parsed
+    /// values, masked 24-bit; emit adds the bank) whose terminal host-returns NORMAL.
+    pub force_host_return_sites: BTreeSet<u32>,
 }
 
 impl BankEntry {
@@ -44,6 +47,7 @@ impl BankEntry {
             force_variants: None,
             exit_mx: None,
             inline_skip: None,
+            force_host_return_sites: BTreeSet::new(),
         }
     }
 }
@@ -296,6 +300,7 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             let mut entry_s_offset_val: i32 = 0;
             let mut inline_skip_val: Option<i32> = None;
             let mut force_variants_val: Option<Vec<(u8, u8)>> = None;
+            let mut force_host_return_sites_val: BTreeSet<u32> = BTreeSet::new();
             for t in &tokens[3..] {
                 if let Some(v) = t.strip_prefix("end:") {
                     if let Ok(e) = parse_hex(v) {
@@ -342,6 +347,23 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                     if let Ok(n) = v.parse::<i32>() {
                         inline_skip_val = Some(n);
                     }
+                } else if let Some(raw) = t.strip_prefix("force_host_return") {
+                    // `force_host_return:<hex>[,<hex>]` — terminal RTS/RTL at the
+                    // named SITE(s) host-returns RECOMP_RETURN_NORMAL, bypassing
+                    // balanced-stack / ancestor-skip / dispatch. Lets a multi-
+                    // return function host-return only its terminal. A bare token
+                    // (no `:`) contributes no sites (matches the Python).
+                    if let Some(list) = raw.strip_prefix(':') {
+                        for tok in list.split(',') {
+                            let tok = tok.trim();
+                            if tok.is_empty() {
+                                continue;
+                            }
+                            if let Ok(v) = u32::from_str_radix(tok, 16) {
+                                force_host_return_sites_val.insert(v & 0xFFFFFF);
+                            }
+                        }
+                    }
                 }
             }
             let mut be = BankEntry::new(Some(name.clone()), start);
@@ -351,6 +373,7 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
             be.exit_mx = exit_mx;
             be.inline_skip = inline_skip_val;
             be.force_variants = force_variants_val;
+            be.force_host_return_sites = force_host_return_sites_val;
             // Entry-mode seed: explicit entry_mx: wins; else *_STRAT/_ISTRAT → M1X0.
             if let Some((m, x)) = entry_mx {
                 be.entry_m = m;

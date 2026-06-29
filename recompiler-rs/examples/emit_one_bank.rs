@@ -61,6 +61,7 @@ fn main() {
         name: e.name.clone(), start: e.start, end: e.end,
         entry_m: e.entry_m, entry_x: e.entry_x,
         tail_call_pc16: None, entry_s_offset: e.entry_s_offset,
+        force_host_return_sites: e.force_host_return_sites.clone(),
     }).collect();
     let spc: BTreeSet<u32> = c.hle_spc_upload.iter().copied().collect();
     let hle = EmitHle {

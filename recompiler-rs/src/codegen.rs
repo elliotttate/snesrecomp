@@ -1097,7 +1097,7 @@ fn reg_dbg(r: Reg) -> String {
 
 // ── Return / Call / dispatch (ctx-aware) ─────────────────────────────────────
 
-fn emit_return(op: &Return) -> Vec<String> {
+fn emit_return(op: &Return, fhr_sites: Option<&BTreeSet<u32>>) -> Vec<String> {
     if op.interrupt {
         return vec![
             "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);".to_string(),
@@ -1110,6 +1110,29 @@ fn emit_return(op: &Return) -> Vec<String> {
     }
     let label_inner = if op.long { "RTL" } else { "RTS" };
     let src24 = op.source_pc24.unwrap_or(0) & 0xFFFFFF;
+    // force_host_return: the RTS/RTL at this SITE host-returns NORMAL (popping the
+    // HW return frame, restoring the real caller's PC) instead of dispatching the
+    // popped PC — for "exit epilogue" sites reached via a computed dispatch. cf.
+    // SF $03:E18C / $03:E97A.
+    if fhr_sites.map_or(false, |s| s.contains(&src24)) {
+        let mut pop_lines = vec![
+            format!("{{ /* {label_inner} force_host_return: pop frame, host-return NORMAL */"),
+            "  uint16 _ret_s = cpu->S;".to_string(),
+            "  cpu->S = (uint16)(cpu->S + 1);".to_string(),
+            "  uint16 _rpcl = (uint16)cpu_read8(cpu, 0x00, cpu->S);".to_string(),
+            "  cpu->S = (uint16)(cpu->S + 1);".to_string(),
+            "  uint16 _rpch = (uint16)cpu_read8(cpu, 0x00, cpu->S);".to_string(),
+        ];
+        if op.long {
+            pop_lines.push("  cpu->S = (uint16)(cpu->S + 1);".to_string());
+            pop_lines.push("  uint8 _rpb = cpu_read8(cpu, 0x00, cpu->S);".to_string());
+        } else {
+            pop_lines.push("  uint8 _rpb = cpu->PB;".to_string());
+        }
+        pop_lines.push("  (void)_rpcl; (void)_rpch; (void)_rpb; (void)_ret_s;".to_string());
+        pop_lines.push("  return RECOMP_RETURN_NORMAL; }".to_string());
+        return pop_lines;
+    }
     let mut lines = vec![
         format!("{{ uint16 _ret_s = cpu->S;  /* {label_inner} pop hardware return frame */"),
         "  cpu->S = (uint16)(cpu->S + 1);".to_string(),
@@ -1615,7 +1638,12 @@ impl EmitCtx {
 /// Lower a single IR op to C lines. Pure ops use no ctx; Call uses ctx+outcome.
 /// Control-flow ops (CondBranch/Goto/IndirectGoto) are handled at block level,
 /// matching the Python `_emit_*` stubs.
-pub fn emit_op(ctx: &EmitCtx, op: &IROp, outcome: &mut EmitOutcome) -> Vec<String> {
+pub fn emit_op(
+    ctx: &EmitCtx,
+    op: &IROp,
+    outcome: &mut EmitOutcome,
+    fhr_sites: Option<&BTreeSet<u32>>,
+) -> Vec<String> {
     let lines: Vec<String> = match op {
         IROp::Read { seg, width, out } => emit_read(seg, *width, *out),
         IROp::Write { seg, src, width } => emit_write(seg, *src, *width),
@@ -1651,7 +1679,7 @@ pub fn emit_op(ctx: &EmitCtx, op: &IROp, outcome: &mut EmitOutcome) -> Vec<Strin
             vec![format!("/* IndirectGoto: target = ({bank}, {addr}) — caller dispatches */")]
         }
         IROp::Call(c) => ctx.emit_call(c, outcome),
-        IROp::Return(r) => emit_return(r),
+        IROp::Return(r) => emit_return(r, fhr_sites),
         IROp::Transfer { src, dst } => emit_transfer(*src, *dst),
         IROp::Nop => vec!["/* NOP */".to_string()],
         IROp::Break { cop } => emit_break(*cop),

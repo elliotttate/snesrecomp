@@ -27,6 +27,8 @@ pub struct EmitHle<'a> {
     pub exclude_ranges: Option<&'a [(u32, u32)]>,
     pub tail_call_pc16: Option<u32>,
     pub tail_call_target_name: Option<&'a str>,
+    /// cfg `force_host_return:<sites>` — RTS/RTL SITE pc24s that host-return NORMAL.
+    pub force_host_return_sites: Option<&'a BTreeSet<u32>>,
 }
 
 fn label_for(key: &DecodeKey) -> String {
@@ -379,7 +381,7 @@ pub fn emit_function(
                         }
                     }
                     IROp::Return(_) => {
-                        for ln in emit_op(ctx, op, outcome) {
+                        for ln in emit_op(ctx, op, outcome, hle.force_host_return_sites) {
                             lines.push(ln);
                         }
                         block_terminated = true;
@@ -432,13 +434,13 @@ pub fn emit_function(
                                 block_terminated = true;
                             }
                         } else {
-                            for ln in emit_op(ctx, op, outcome) {
+                            for ln in emit_op(ctx, op, outcome, hle.force_host_return_sites) {
                                 lines.push(ln);
                             }
                         }
                     }
                     _ => {
-                        for ln in emit_op(ctx, op, outcome) {
+                        for ln in emit_op(ctx, op, outcome, hle.force_host_return_sites) {
                             lines.push(ln);
                         }
                     }
@@ -581,6 +583,8 @@ pub struct BankEntrySpec {
     pub entry_x: u8,
     pub tail_call_pc16: Option<u32>,
     pub entry_s_offset: i32,
+    /// cfg `force_host_return:<sites>` — parsed local site values (emit adds the bank).
+    pub force_host_return_sites: BTreeSet<u32>,
 }
 
 fn default_func_name_local(bank: u32, start: u32) -> String {
@@ -670,9 +674,16 @@ pub fn emit_bank(
         };
         let mut e_env = env.clone();
         e_env.sibling_entry_pcs = Some(&sibling_sets[i]);
+        // Convert the entry's parsed force_host_return sites to pc24 (add the bank).
+        let fhr_pc24: BTreeSet<u32> = entry
+            .force_host_return_sites
+            .iter()
+            .map(|a| (bank << 16) | (a & 0xFFFF))
+            .collect();
         let e_hle = EmitHle {
             tail_call_pc16: entry.tail_call_pc16,
             tail_call_target_name: tail_call_target_name.as_deref(),
+            force_host_return_sites: if fhr_pc24.is_empty() { None } else { Some(&fhr_pc24) },
             ..*hle
         };
         let src = emit_function(
