@@ -21,3 +21,6 @@ pub mod widths;
 
 // Phase 2 — decoder + CFG build (types fixed; heavy body delegated, oracle-gated).
 pub mod decoder;
+
+// Phase 3 — CFG build + lowering + codegen + emit.
+pub mod cfgbuild;

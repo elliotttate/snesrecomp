@@ -37,7 +37,7 @@ pub fn addr24(bank: u32, pc: u32) -> u32 {
 
 /// Identifies a decoded instruction by 24-bit address + entry M/X + PHP/PLP
 /// stack history. Two keys are equal iff (pc, m, x, p_stack) all match.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DecodeKey {
     pub pc: u32, // 24-bit ((bank << 16) | local_pc)
     pub m: u8,
