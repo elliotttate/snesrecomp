@@ -19,4 +19,5 @@ pub mod ir;
 pub mod rom;
 pub mod widths;
 
-// Phase 2+ modules land here as they are ported.
+// Phase 2 — decoder + CFG build (types fixed; heavy body delegated, oracle-gated).
+pub mod decoder;

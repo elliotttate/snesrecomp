@@ -99,6 +99,14 @@ pub struct Insn {
     pub x_flag: u8,
 
     // Annotation fields filled by the Phase 2 function decoder.
+    // Resolved indirect-dispatch metadata (cfg/auto). `dispatch_entries` holds
+    // the resolved target pc24 list; `dispatch_kind` is 'short'/'long' for
+    // helper sites; `dispatch_idx_reg` is 'X'/'Y' for cfg sites; for parallel
+    // byte tables `dispatch_table_bases` has len >= 2.
+    pub dispatch_entries: Option<Vec<u32>>,
+    pub dispatch_kind: Option<String>,
+    pub dispatch_idx_reg: Option<char>,
+    pub dispatch_table_bases: Vec<u32>,
     pub dispatch_terminal: bool,
     pub const_z_fold_unconditional: bool,
     pub const_z_fold_dead_pc24: Option<u32>,
@@ -116,6 +124,10 @@ impl Insn {
             length,
             m_flag: 1,
             x_flag: 1,
+            dispatch_entries: None,
+            dispatch_kind: None,
+            dispatch_idx_reg: None,
+            dispatch_table_bases: Vec::new(),
             dispatch_terminal: false,
             const_z_fold_unconditional: false,
             const_z_fold_dead_pc24: None,

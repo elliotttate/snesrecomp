@@ -120,8 +120,10 @@ fn is_valid_c_ident(name: &str) -> bool {
 /// directive; unrecognized directives are silently ignored.
 pub fn load_bank_cfg<P: AsRef<Path>>(path: P) -> Result<BankCfg, String> {
     let path_disp = path.as_ref().display().to_string();
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{path_disp}: {e}"))?;
+    // Python opens with errors='replace' — tolerate invalid UTF-8 (cfgs are
+    // ASCII in practice, but a stray byte must not abort the load).
+    let bytes = std::fs::read(&path).map_err(|e| format!("{path_disp}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes);
     parse_bank_cfg(&text, &path_disp)
 }
 
@@ -312,13 +314,24 @@ pub fn parse_bank_cfg(text: &str, path: &str) -> Result<BankCfg, String> {
                         entry_mx = Some(mx);
                     }
                 } else if let Some(v) = t.strip_prefix("force_variants:") {
+                    // Python wraps the whole loop in one try: a 2-element pair
+                    // whose int() fails discards the ENTIRE option (not just
+                    // that pair). A non-2-element split is skipped silently.
                     let mut pairs = Vec::new();
+                    let mut aborted = false;
                     for pair in v.split(';') {
-                        if let Some(mx) = parse_mx_pair(pair) {
-                            pairs.push(mx);
+                        let pv: Vec<&str> = pair.split(',').collect();
+                        if pv.len() == 2 {
+                            match (pv[0].parse::<i32>(), pv[1].parse::<i32>()) {
+                                (Ok(m), Ok(x)) => pairs.push(((m & 1) as u8, (x & 1) as u8)),
+                                _ => {
+                                    aborted = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    if !pairs.is_empty() {
+                    if !aborted && !pairs.is_empty() {
                         force_variants_val = Some(pairs);
                     }
                 } else if let Some(v) = t.strip_prefix("entry_s_offset:") {

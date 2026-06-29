@@ -22,7 +22,9 @@ pub fn load_rom<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 /// $8000-$FFFF (the Python asserts this).
 #[inline]
 pub fn lorom_offset(bank: u32, addr: u32) -> usize {
-    debug_assert!(
+    // Always assert (Python uses a bare `assert`, active in all builds) so an
+    // invalid address fails loudly instead of underflowing in release.
+    assert!(
         (0x8000..=0xFFFF).contains(&addr),
         "addr ${addr:04X} not in LoROM range $8000-$FFFF"
     );
