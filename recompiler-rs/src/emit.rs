@@ -6,12 +6,17 @@
 //! consults the trampoline set), so this port omits that dead-for-output code and
 //! emits every PLA/PLP and Return normally — matching the Python output exactly.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::cfgbuild::build_cfg;
 use crate::codegen::{emit_op, reg_field, variant_suffix, EmitCtx, EmitOutcome};
 use crate::cycles::estimate_cycles;
-use crate::decoder::{decode_function, DecodeCache, DecodeEnv, DecodeKey};
+use crate::decoder::{
+    compute_deps, decode_deps_match, decode_function, CemDep, CmmDep, DecodeEnv, DecodeKey,
+    FunctionDecodeGraph,
+};
 use crate::insn::{Insn, Mode};
 use crate::ir::IROp;
 use crate::lowering::{lower, ValueFactory};
@@ -110,6 +115,130 @@ fn goto_or_return(
     )
 }
 
+// ── Per-function EMIT-output cache ────────────────────────────────────────────
+//
+// Profiling shows decode is ~2% of regen wall-clock; CODEGEN (lower + emit_op +
+// string build) is ~98%. The DecodeCache (now removed) memoized the wrong thing.
+// `EmitCache` memoizes the EMITTED C TEXT (and the call-target outcome) per
+// function across the orchestrator's auto-promote passes.
+//
+// A cached `(text, outcome)` for base key (bank,start,m,x,end,cem_present) is
+// reused iff BOTH dependency sets still hold:
+//   1. DECODE deps — `decode_deps_match` (cem/cmm key→value pairs + sibling PCs):
+//      if these hold, re-decoding would produce an identical graph.
+//   2. EMIT deps — a graph-derived SUPERSET of every `name_resolver` /
+//      `valid_variant_list` / `force_variant_at` value codegen consults. Each
+//      such read is for a pc24 that appears in the graph as a static call target
+//      (JSR-len3 / JSL / cross-bank JMP-len4), a dispatch-table entry, or a CFG
+//      successor (cross-bank goto name lookup); force_variant_at is read only at
+//      JSR/JSL call SITES. Over-approximation (e.g. recording both a pc24 and its
+//      bank-mirror) only costs an extra re-emit; under-approximation would be a
+//      correctness bug, so when in doubt we record MORE.
+//
+// SAFETY: the per-entry inputs NOT in the base key (entry_s_offset, func_name,
+// and the whole `hle` bundle) are a stable function of (bank,start,m,x) across
+// passes — each base key maps to exactly one cfg/synthesized entry — so they need
+// not be keyed. The fixed decode env (data_regions/reloc/dispatch_helpers/…) is
+// constant for the cache's lifetime, as documented on `decode_deps_match`.
+
+type EmitBase = (u32, u32, u8, u8, Option<u32>, bool);
+type NameDep = (u32, Option<String>);
+type VarDep = (u32, Vec<(u8, u8)>);
+type ForceDep = (u32, Option<(u8, u8)>);
+
+struct EmitCacheEntry {
+    cem_deps: Vec<CemDep>,
+    cmm_deps: Vec<CmmDep>,
+    sib_deps: Vec<u32>,
+    name_deps: Vec<NameDep>,
+    var_deps: Vec<VarDep>,
+    force_deps: Vec<ForceDep>,
+    text: String,
+    outcome: EmitOutcome,
+}
+
+/// Memoizes emitted C text per (bank,start,m,x,end) across auto-promote passes.
+#[derive(Default)]
+pub struct EmitCache {
+    map: Mutex<HashMap<EmitBase, Vec<EmitCacheEntry>>>,
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+}
+
+impl EmitCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True iff every recorded EMIT dependency still equals the current ctx value.
+    fn emit_deps_match(e: &EmitCacheEntry, ctx: &EmitCtx) -> bool {
+        if !e.name_deps.iter().all(|(pc, v)| ctx.name_resolver.get(pc) == v.as_ref()) {
+            return false;
+        }
+        if !e.var_deps.iter().all(|(pc, v)| ctx.valid_variant_list(*pc) == *v) {
+            return false;
+        }
+        e.force_deps.iter().all(|(s, v)| ctx.force_variant_at.get(s).copied() == *v)
+    }
+}
+
+/// Graph-derived SUPERSET of the pc24s codegen looks up in `name_resolver` /
+/// `valid_variant_list`, and the call SITES it looks up in `force_variant_at`.
+/// Returns the recorded (pc, value) dependency vectors for the current `ctx`.
+fn compute_emit_deps(
+    graph: &FunctionDecodeGraph,
+    bank: u32,
+    ctx: &EmitCtx,
+) -> (Vec<NameDep>, Vec<VarDep>, Vec<ForceDep>) {
+    let same_bank = bank & 0xFF;
+    let mut targets: Vec<u32> = Vec::new();
+    let mut sites: Vec<u32> = Vec::new();
+    for di in graph.insns() {
+        let ins = &di.insn;
+        if ins.mnem == "JSR" && ins.length == 3 {
+            // JSR (abs) or JSR (abs,X): static target = (call-site bank, operand16).
+            targets.push((same_bank << 16) | (ins.operand & 0xFFFF));
+            sites.push(ins.addr & 0xFFFFFF);
+        } else if ins.mnem == "JSL" {
+            targets.push(ins.operand & 0xFFFFFF);
+            sites.push(ins.addr & 0xFFFFFF);
+        } else if ins.mnem == "JMP" && ins.length == 4 {
+            // Cross-bank JML: emit-time name lookup, NOT a graph successor.
+            targets.push(ins.operand & 0xFFFFFF);
+        }
+        if let Some(entries) = &ins.dispatch_entries {
+            let is_long = ins.dispatch_kind.as_deref() == Some("long");
+            for &e in entries {
+                let pc24 = if is_long { e & 0xFFFFFF } else { (same_bank << 16) | (e & 0xFFFF) };
+                targets.push(pc24);
+            }
+        }
+        for s in &di.successors {
+            targets.push(s.pc & 0xFFFFFF);
+        }
+    }
+    // Expand each target with its LoROM bank-mirror (both `name_resolver` and
+    // `valid_variant_list` fall back to the mirror, so a dep on either is real).
+    let mut all: Vec<u32> = Vec::with_capacity(targets.len() * 2);
+    for &pc in &targets {
+        all.push(pc);
+        let bk = (pc >> 16) & 0xFF;
+        if bk < 0x40 || (0x80..0xC0).contains(&bk) {
+            all.push(pc ^ 0x800000);
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    sites.sort_unstable();
+    sites.dedup();
+    let name_deps: Vec<NameDep> =
+        all.iter().map(|&pc| (pc, ctx.name_resolver.get(&pc).cloned())).collect();
+    let var_deps: Vec<VarDep> = all.iter().map(|&pc| (pc, ctx.valid_variant_list(pc))).collect();
+    let force_deps: Vec<ForceDep> =
+        sites.iter().map(|&s| (s, ctx.force_variant_at.get(&s).copied())).collect();
+    (name_deps, var_deps, force_deps)
+}
+
 /// Emit a complete v2 C function source for one 65816 function.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_function(
@@ -124,8 +253,8 @@ pub fn emit_function(
     entry_s_offset: i32,
     env: &DecodeEnv,
     hle: &EmitHle,
-    cache: Option<&DecodeCache>,
-    outcome: &mut EmitOutcome,
+    cache: Option<&EmitCache>,
+    outcome_out: &mut EmitOutcome,
 ) -> String {
     let base_func_name = func_name
         .map(|s| s.to_string())
@@ -182,12 +311,43 @@ pub fn emit_function(
         }
     }
 
-    let graph_arc = match cache {
-        Some(c) => c.get_or_decode(rom, bank, start, entry_m, entry_x, end, env),
-        None => std::sync::Arc::new(decode_function(rom, bank, start, entry_m, entry_x, end, env)),
-    };
-    let graph = &*graph_arc;
+    // EMIT-output cache: base key + decode deps + emit deps. The HLE early-returns
+    // above never touch the outcome, so it is safe to short-circuit here.
+    let base_key: EmitBase = (
+        bank & 0xFF,
+        start & 0xFFFF,
+        entry_m & 1,
+        entry_x & 1,
+        end,
+        env.callee_exit_mx.is_some(),
+    );
+    if let Some(c) = cache {
+        let map = c.map.lock().unwrap();
+        if let Some(bucket) = map.get(&base_key) {
+            for e in bucket {
+                if decode_deps_match(&e.cem_deps, &e.cmm_deps, &e.sib_deps, env)
+                    && EmitCache::emit_deps_match(e, ctx)
+                {
+                    c.hits.fetch_add(1, Ordering::Relaxed);
+                    outcome_out
+                        .unresolved_call_targets
+                        .extend(e.outcome.unresolved_call_targets.iter().copied());
+                    outcome_out
+                        .rejected_call_targets
+                        .extend(e.outcome.rejected_call_targets.iter().copied());
+                    return e.text.clone();
+                }
+            }
+        }
+    }
+
+    // Cache miss: decode + emit into a LOCAL outcome (the existing body below is
+    // unchanged — it writes through the rebound `outcome`).
+    let graph_owned = decode_function(rom, bank, start, entry_m, entry_x, end, env);
+    let graph = &graph_owned;
     let cfg = build_cfg(graph);
+    let mut local_outcome = EmitOutcome::default();
+    let outcome = &mut local_outcome;
 
     let func_name = format!("{base_func_name}{}", variant_suffix(entry_m, entry_x));
 
@@ -554,6 +714,30 @@ pub fn emit_function(
     src.push("}".to_string());
     let mut out = src.join("\n");
     out.push('\n');
+
+    // Record the miss in the cache (compute deps from the SAME graph + ctx) and
+    // fold the local outcome into the caller's.
+    if let Some(c) = cache {
+        let (cem_deps, cmm_deps, sib_deps) = compute_deps(graph, env);
+        let (name_deps, var_deps, force_deps) = compute_emit_deps(graph, bank, ctx);
+        c.misses.fetch_add(1, Ordering::Relaxed);
+        c.map.lock().unwrap().entry(base_key).or_default().push(EmitCacheEntry {
+            cem_deps,
+            cmm_deps,
+            sib_deps,
+            name_deps,
+            var_deps,
+            force_deps,
+            text: out.clone(),
+            outcome: local_outcome.clone(),
+        });
+    }
+    outcome_out
+        .unresolved_call_targets
+        .extend(local_outcome.unresolved_call_targets.iter().copied());
+    outcome_out
+        .rejected_call_targets
+        .extend(local_outcome.rejected_call_targets.iter().copied());
     out
 }
 
@@ -626,7 +810,7 @@ pub fn emit_bank(
     entries: &[BankEntrySpec],
     env: &DecodeEnv,
     hle: &EmitHle,
-    cache: Option<&DecodeCache>,
+    cache: Option<&EmitCache>,
     file_header: Option<&str>,
     outcome: &mut EmitOutcome,
 ) -> String {

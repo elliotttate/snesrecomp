@@ -20,7 +20,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::cfg::{BankCfg, IndirectDispatch, NameDecl};
 use crate::decoder::{
-    analyze_function_exit_mx, classify_dispatch_helper, decode_function, DecodeEnv,
+    analyze_function_exit_mx, classify_dispatch_helper, decode_function, DecodeCache, DecodeEnv,
     FunctionDecodeGraph,
 };
 use crate::rom::{lorom_offset, RelocRegion};
@@ -499,6 +499,7 @@ const MX_COMBOS: [(u8, u8); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
 const EXIT_MX_MAX_ITERS: usize = 12;
 
 /// Decode one variant and return its unambiguous exit (m, x), or None.
+#[allow(clippy::too_many_arguments)]
 fn decode_variant_exit(
     rom: &[u8],
     bank: u32,
@@ -507,9 +508,11 @@ fn decode_variant_exit(
     ex: u8,
     end: Option<u32>,
     env: &DecodeEnv,
+    cache: Option<&DecodeCache>,
 ) -> Option<(u8, u8)> {
-    let graph = match catch_unwind(AssertUnwindSafe(|| {
-        decode_function(rom, bank, addr16, em, ex, end, env)
+    let graph = match catch_unwind(AssertUnwindSafe(|| match cache {
+        Some(c) => c.get_or_decode(rom, bank, addr16, em, ex, end, env),
+        None => std::sync::Arc::new(decode_function(rom, bank, addr16, em, ex, end, env)),
     })) {
         Ok(g) => g,
         Err(_) => return None,
@@ -544,6 +547,7 @@ pub fn exit_mx_detect_and_route(
     rom: &[u8],
     dispatch_helpers: &HashMap<u32, String>,
     reloc_regions: &[RelocRegion],
+    cache: Option<&DecodeCache>,
 ) -> Vec<ExitMxFix> {
     let mut fixes = Vec::new();
 
@@ -611,7 +615,7 @@ pub fn exit_mx_detect_and_route(
                         callee_exit_mx: Some(&callee_exit_mx),
                         ..Default::default()
                     };
-                    decode_variant_exit(rom, e.bank, e.addr16, em, ex, e.end, &env)
+                    decode_variant_exit(rom, e.bank, e.addr16, em, ex, e.end, &env, cache)
                 };
                 match exit_pair {
                     None => {
@@ -807,7 +811,7 @@ mod tests {
         let mut parsed = vec![parse_bank_cfg("bank = 00\nfunc Leaf 8000 end:8003\n", "t").unwrap()];
         let helpers: HashMap<u32, String> = HashMap::new();
         let reloc: Vec<RelocRegion> = Vec::new();
-        let fixes = exit_mx_detect_and_route(&mut parsed, &rom, &helpers, &reloc);
+        let fixes = exit_mx_detect_and_route(&mut parsed, &rom, &helpers, &reloc, None);
         // Entry variants (0,0)->(1,0) and (0,1)->(1,1) mutate m; (1,*) preserved.
         let mut got: Vec<(u8, u8, u8, u8)> = fixes
             .iter()

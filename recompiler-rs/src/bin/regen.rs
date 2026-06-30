@@ -28,7 +28,7 @@ use snesrecomp_regen::decoder::{
     analyze_function_exit_mx_modes, decode_function, DecodeCache, DecodeEnv, FunctionDecodeGraph,
     IndirectDispatchSite,
 };
-use snesrecomp_regen::emit::{emit_bank, BankEntrySpec, EmitHle};
+use snesrecomp_regen::emit::{emit_bank, BankEntrySpec, EmitCache, EmitHle};
 use snesrecomp_regen::rom::{load_rom, RelocRegion};
 
 type VKey = (u32, u8, u8); // (addr24, m, x)
@@ -900,7 +900,13 @@ fn main() {
     let dispatch_helpers: HashMap<u32, String> =
         dispatch_helpers_bt.iter().map(|(k, v)| (*k, v.clone())).collect();
     println!("Auto-detected {} JSL dispatch helpers", dispatch_helpers.len());
-    let exit_fixes = exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions);
+    // Persistent decode cache for the exit-mx fixpoint (its env — dispatch_helpers,
+    // reloc, inline_skip — is constant from here on; callee_exit_mx is dependency-
+    // keyed). exit-mx is ~95% of regen wall-clock; this collapses its 12-iter
+    // fixpoint and the per-pass re-runs.
+    let exit_mx_cache = DecodeCache::new();
+    let exit_fixes =
+        exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions, Some(&exit_mx_cache));
     println!("Auto-detecting leaf exit-(M,X) mutations... {} fix(es)", exit_fixes.len());
     phase("autoroute (wrapper/tail/pha/dispatch-helpers/exit-mx)");
 
@@ -1080,7 +1086,7 @@ fn main() {
         for cfg in parsed.iter_mut() {
             cfg.exit_mx_at_per_variant.clear();
         }
-        let _ = exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions);
+        let _ = exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions, Some(&exit_mx_cache));
         callee_exit_mx = rebuild_callee_exit_mx(&parsed, &variants);
         callee_exit_mx_modes = build_callee_exit_mx_modes(
             &parsed, &rom, &dispatch_helpers, &all_data_regions, &callee_exit_mx, &reloc_regions,
@@ -1110,12 +1116,12 @@ fn main() {
     const RT_TOTAL_LIMIT: usize = 40;
     let mut rt_total_passes = 0usize;
 
-    // Dependency-keyed decode cache, shared across all emit passes. Correct here
+    // Per-function EMIT-output cache, shared across all emit passes. Correct here
     // because the FIXED decode env (dispatch_helpers, data_regions, reloc,
     // inline_skip, indirect_dispatch) is constant after autoroute; only
-    // callee_exit_mx/_modes (dependency-checked) and sibling_entry_pcs (keyed)
-    // vary across passes.
-    let decode_cache = DecodeCache::new();
+    // callee_exit_mx/_modes (decode-dependency-checked) and sibling_entry_pcs vary
+    // across passes, plus the name/variant/force ctx state (emit-dependency-checked).
+    let emit_cache = EmitCache::new();
 
     for pass_idx in 0..max_passes {
         succeeded = 0;
@@ -1189,7 +1195,7 @@ fn main() {
         // Emit (rayon).
         let ctx_ref = &ctx;
         let rom_ref = &rom;
-        let cache_ref = &decode_cache;
+        let cache_ref = &emit_cache;
         let helpers_ref = &dispatch_helpers;
         let inline_skip_ref = &callee_inline_skip;
         let cem_ref = &callee_exit_mx;
@@ -1323,12 +1329,20 @@ fn main() {
         for cfg in parsed.iter_mut() {
             cfg.exit_mx_at_per_variant.clear();
         }
-        let _ = exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions);
+        let _t = Instant::now();
+        let _ = exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions, Some(&exit_mx_cache));
+        if timing {
+            println!("    exit_mx_detect_and_route {:.2}s", _t.elapsed().as_secs_f64());
+        }
         callee_exit_mx = rebuild_callee_exit_mx(&parsed, &variants);
+        let _t = Instant::now();
         callee_exit_mx_modes = build_callee_exit_mx_modes(
             &parsed, &rom, &dispatch_helpers, &all_data_regions, &callee_exit_mx, &reloc_regions,
             &callee_inline_skip,
         );
+        if timing {
+            println!("    build_callee_exit_mx_modes {:.2}s", _t.elapsed().as_secs_f64());
+        }
         exit_mx_rescan_all = true;
 
         // Refresh name resolver with newly-synthesized entries.
@@ -1406,10 +1420,10 @@ fn main() {
 
     let final_elapsed = start_time.elapsed().as_secs_f64();
     if timing {
-        let h = decode_cache.hits.load(std::sync::atomic::Ordering::Relaxed);
-        let m = decode_cache.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let h = emit_cache.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let m = emit_cache.misses.load(std::sync::atomic::Ordering::Relaxed);
         let pct = if h + m > 0 { 100.0 * h as f64 / (h + m) as f64 } else { 0.0 };
-        println!("  decode cache: {h} hits / {m} misses ({pct:.1}% hit)");
+        println!("  emit cache: {h} hits / {m} misses ({pct:.1}% hit)");
     }
     println!("v2_regen wall-clock: {final_elapsed:.1}s");
 

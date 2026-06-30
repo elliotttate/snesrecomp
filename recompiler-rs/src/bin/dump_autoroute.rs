@@ -156,7 +156,7 @@ fn main() {
     let dispatch_helpers = discover_dispatch_helpers(&parsed, &rom, &basic_env);
     // 5. exit_mx
     let exit_mx_fixes =
-        exit_mx_detect_and_route(&mut parsed, &rom, &helpers_as_hashmap(&dispatch_helpers), &reloc_regions);
+        exit_mx_detect_and_route(&mut parsed, &rom, &helpers_as_hashmap(&dispatch_helpers), &reloc_regions, None);
 
     // Build output JSON.
     let mut banks = Map::new();
