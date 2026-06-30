@@ -1495,6 +1495,12 @@ fn clone_variant_entries(parsed: &mut [BankCfg], variants: &Variants) {
                     ne.end = entry.end;
                     ne.entry_m = em;
                     ne.entry_x = ex;
+                    // Inherit force_host_return_sites so cloned (m,x) variants also
+                    // apply the per-site host-return directive — the clone is the
+                    // same function at a different (m,x), so its terminals are the
+                    // same sites (matches v2_regen aec15e4). Variant-discovery and
+                    // autopromote clones (elsewhere) do NOT inherit, also per Python.
+                    ne.force_host_return_sites = entry.force_host_return_sites.clone();
                     new_entries.push(ne);
                 }
             }
