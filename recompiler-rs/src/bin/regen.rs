@@ -25,7 +25,7 @@ use snesrecomp_regen::autoroute::{
 use snesrecomp_regen::cfg::{load_bank_cfg, BankCfg, BankEntry, NameDecl};
 use snesrecomp_regen::codegen::{EmitCtx, EmitOutcome};
 use snesrecomp_regen::decoder::{
-    analyze_function_exit_mx_modes, decode_function, DecodeEnv, FunctionDecodeGraph,
+    analyze_function_exit_mx_modes, decode_function, DecodeCache, DecodeEnv, FunctionDecodeGraph,
     IndirectDispatchSite,
 };
 use snesrecomp_regen::emit::{emit_bank, BankEntrySpec, EmitHle};
@@ -1110,6 +1110,13 @@ fn main() {
     const RT_TOTAL_LIMIT: usize = 40;
     let mut rt_total_passes = 0usize;
 
+    // Dependency-keyed decode cache, shared across all emit passes. Correct here
+    // because the FIXED decode env (dispatch_helpers, data_regions, reloc,
+    // inline_skip, indirect_dispatch) is constant after autoroute; only
+    // callee_exit_mx/_modes (dependency-checked) and sibling_entry_pcs (keyed)
+    // vary across passes.
+    let decode_cache = DecodeCache::new();
+
     for pass_idx in 0..max_passes {
         succeeded = 0;
         failed.clear();
@@ -1182,6 +1189,7 @@ fn main() {
         // Emit (rayon).
         let ctx_ref = &ctx;
         let rom_ref = &rom;
+        let cache_ref = &decode_cache;
         let helpers_ref = &dispatch_helpers;
         let inline_skip_ref = &callee_inline_skip;
         let cem_ref = &callee_exit_mx;
@@ -1214,7 +1222,7 @@ fn main() {
                 };
                 let mut outcome = EmitOutcome::default();
                 let res = catch_unwind(AssertUnwindSafe(|| {
-                    emit_bank(ctx_ref, rom_ref, inp.bank, &inp.entries, &env, &hle, None, &mut outcome)
+                    emit_bank(ctx_ref, rom_ref, inp.bank, &inp.entries, &env, &hle, Some(cache_ref), None, &mut outcome)
                 }));
                 match res {
                     Ok(src) => BankResult { bank: inp.bank, src, outcome },
@@ -1397,6 +1405,12 @@ fn main() {
     }
 
     let final_elapsed = start_time.elapsed().as_secs_f64();
+    if timing {
+        let h = decode_cache.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let m = decode_cache.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let pct = if h + m > 0 { 100.0 * h as f64 / (h + m) as f64 } else { 0.0 };
+        println!("  decode cache: {h} hits / {m} misses ({pct:.1}% hit)");
+    }
     println!("v2_regen wall-clock: {final_elapsed:.1}s");
 
     // ── Stub lint. ──

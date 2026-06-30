@@ -72,7 +72,7 @@ fn main() {
         ..Default::default()
     };
     let mut outcome = EmitOutcome::default();
-    let src = emit_bank(&ctx, &rom, want_bank, &entries, &env, &hle, None, &mut outcome);
+    let src = emit_bank(&ctx, &rom, want_bank, &entries, &env, &hle, None, None, &mut outcome);
     std::fs::write(&out, src).unwrap();
     eprintln!("wrote {} ({} entries)", out, entries.len());
 }

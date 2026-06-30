@@ -10,6 +10,8 @@
 //! walk.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::insn::{decode_insn, Insn, Mode};
 use crate::rom::{addr_in_reloc_region, addr_to_rom_offset, RelocRegion};
@@ -1722,6 +1724,154 @@ fn lorom_offset_opt(bank: u32, addr: u32) -> Option<usize> {
         Some(((bank & 0x7F) as usize) * 0x8000 + (a as usize - 0x8000))
     } else {
         None
+    }
+}
+
+// ── Dependency-keyed decode cache ─────────────────────────────────────────────
+//
+// `decode_function` is pure in (rom, bank, start, m, x, end, env). Across the
+// orchestrator's ~6 auto-promote passes + discovery it re-decodes the same
+// functions tens of times. The only env inputs that VARY across passes are
+// `callee_exit_mx` / `callee_exit_mx_modes` (grow as routes are discovered) and
+// `sibling_entry_pcs` (grows as a bank gains entries); the rest (data_regions,
+// reloc, dispatch_helpers, inline_skip, indirect_dispatch, …) are fixed once.
+//
+// So we memoize keyed on (bank,start,m,x,end, sibling_hash, cem_present) PLUS a
+// recorded dependency set: the exact `callee_exit_mx`/`_modes` (key→value) pairs
+// the decode consulted. A cached graph is reused iff every recorded dependency
+// still returns the same value — provably equivalent to re-decoding. The
+// dependency set is computed from the resulting graph (every JSR-len3 / JSL call
+// target, at the call site's (m,x), plus the bank-mirror key — exactly the keys
+// `labeled_successors` queries), so no recorder threading is needed.
+//
+// SAFETY: the caller must keep the *fixed* env (everything except cem/cmm/sibling)
+// constant for the cache's lifetime. The orchestrator builds the cache after
+// autoroute (dispatch_helpers final) and uses it only on the emit path, which
+// always passes that one consistent fixed env.
+
+type CemKey = (u32, u8, u8);
+type CemDep = (CemKey, Option<(u8, u8)>);
+type CmmDep = (CemKey, Option<Vec<(u8, u8)>>);
+type CacheBase = (u32, u32, u8, u8, Option<u32>, bool);
+
+struct CacheEntry {
+    cem_deps: Vec<CemDep>,
+    cmm_deps: Vec<CmmDep>,
+    /// 16-bit successor PCs imported by this decode (all non-siblings at decode
+    /// time). The orchestrator only ever GROWS `sibling_entry_pcs`, so the graph
+    /// is invalidated iff any of these became a sibling (which would refuse its
+    /// import). PCs not jumped to are irrelevant → no false invalidation.
+    sibling_deps: Vec<u32>,
+    graph: Arc<FunctionDecodeGraph>,
+}
+
+#[derive(Default)]
+pub struct DecodeCache {
+    map: Mutex<HashMap<CacheBase, Vec<CacheEntry>>>,
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+}
+
+/// The exact `callee_exit_mx` / `_modes` keys `labeled_successors` queries (every
+/// JSR-len3/JSL static call target at its call-site (m,x), plus the bank-mirror)
+/// and the set of imported successor PCs (for the sibling dependency).
+fn compute_deps(graph: &FunctionDecodeGraph, env: &DecodeEnv) -> (Vec<CemDep>, Vec<CmmDep>, Vec<u32>) {
+    let mut cem_keys: Vec<CemKey> = Vec::new();
+    let mut sib_pcs: Vec<u32> = Vec::new();
+    for di in graph.insns() {
+        let ins = &di.insn;
+        let tp: Option<u32> = if ins.mnem == "JSR" && ins.length == 3 {
+            Some(addr24((ins.addr >> 16) & 0xFF, ins.operand & 0xFFFF))
+        } else if ins.mnem == "JSL" {
+            Some(ins.operand & 0xFFFFFF)
+        } else {
+            None
+        };
+        if let Some(tp) = tp {
+            cem_keys.push((tp, ins.m_flag, ins.x_flag));
+            let tbank = (tp >> 16) & 0xFF;
+            if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+                cem_keys.push((tp ^ 0x800000, ins.m_flag, ins.x_flag));
+            }
+        }
+        for s in &di.successors {
+            sib_pcs.push(s.pc & 0xFFFF);
+        }
+    }
+    cem_keys.sort_unstable();
+    cem_keys.dedup();
+    sib_pcs.sort_unstable();
+    sib_pcs.dedup();
+    let cem = env.callee_exit_mx;
+    let cmm = env.callee_exit_mx_modes;
+    let deps: Vec<CemDep> = cem_keys
+        .iter()
+        .map(|k| (*k, cem.and_then(|m| m.get(k)).copied()))
+        .collect();
+    let mdeps: Vec<CmmDep> = cem_keys
+        .iter()
+        .map(|k| (*k, cmm.and_then(|m| m.get(k)).cloned()))
+        .collect();
+    (deps, mdeps, sib_pcs)
+}
+
+impl DecodeCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode (bank, start, m, x, end) under `env`, returning a shared graph from
+    /// the cache when the recorded dependencies still hold.
+    pub fn get_or_decode(
+        &self,
+        rom: &[u8],
+        bank: u32,
+        start: u32,
+        m: u8,
+        x: u8,
+        end: Option<u32>,
+        env: &DecodeEnv,
+    ) -> Arc<FunctionDecodeGraph> {
+        let m = m & 1;
+        let x = x & 1;
+        let base: CacheBase = (bank & 0xFF, start & 0xFFFF, m, x, end, env.callee_exit_mx.is_some());
+        let cem = env.callee_exit_mx;
+        let cmm = env.callee_exit_mx_modes;
+        let sib = env.sibling_entry_pcs;
+        {
+            let map = self.map.lock().unwrap();
+            if let Some(bucket) = map.get(&base) {
+                for e in bucket {
+                    let cem_ok = e
+                        .cem_deps
+                        .iter()
+                        .all(|(k, v)| cem.and_then(|m| m.get(k)).copied() == *v);
+                    let cmm_ok = cem_ok
+                        && e.cmm_deps
+                            .iter()
+                            .all(|(k, v)| cmm.and_then(|m| m.get(k)).cloned() == *v);
+                    let sib_ok = cmm_ok
+                        && match sib {
+                            None => true,
+                            Some(s) => !e.sibling_deps.iter().any(|pc| s.contains(pc)),
+                        };
+                    if sib_ok {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return e.graph.clone();
+                    }
+                }
+            }
+        }
+        let g = Arc::new(decode_function(rom, bank, start, m, x, end, env));
+        let (cem_deps, cmm_deps, sibling_deps) = compute_deps(&g, env);
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.map.lock().unwrap().entry(base).or_default().push(CacheEntry {
+            cem_deps,
+            cmm_deps,
+            sibling_deps,
+            graph: g.clone(),
+        });
+        g
     }
 }
 

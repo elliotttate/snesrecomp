@@ -129,6 +129,7 @@ fn main() {
                     e.entry_s_offset,
                     &env,
                     &hle,
+                    None,
                     &mut outcome,
                 )
             }));

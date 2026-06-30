@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::cfgbuild::build_cfg;
 use crate::codegen::{emit_op, reg_field, variant_suffix, EmitCtx, EmitOutcome};
 use crate::cycles::estimate_cycles;
-use crate::decoder::{decode_function, DecodeEnv, DecodeKey};
+use crate::decoder::{decode_function, DecodeCache, DecodeEnv, DecodeKey};
 use crate::insn::{Insn, Mode};
 use crate::ir::IROp;
 use crate::lowering::{lower, ValueFactory};
@@ -124,6 +124,7 @@ pub fn emit_function(
     entry_s_offset: i32,
     env: &DecodeEnv,
     hle: &EmitHle,
+    cache: Option<&DecodeCache>,
     outcome: &mut EmitOutcome,
 ) -> String {
     let base_func_name = func_name
@@ -181,8 +182,12 @@ pub fn emit_function(
         }
     }
 
-    let graph = decode_function(rom, bank, start, entry_m, entry_x, end, env);
-    let cfg = build_cfg(&graph);
+    let graph_arc = match cache {
+        Some(c) => c.get_or_decode(rom, bank, start, entry_m, entry_x, end, env),
+        None => std::sync::Arc::new(decode_function(rom, bank, start, entry_m, entry_x, end, env)),
+    };
+    let graph = &*graph_arc;
+    let cfg = build_cfg(graph);
 
     let func_name = format!("{base_func_name}{}", variant_suffix(entry_m, entry_x));
 
@@ -621,6 +626,7 @@ pub fn emit_bank(
     entries: &[BankEntrySpec],
     env: &DecodeEnv,
     hle: &EmitHle,
+    cache: Option<&DecodeCache>,
     file_header: Option<&str>,
     outcome: &mut EmitOutcome,
 ) -> String {
@@ -698,6 +704,7 @@ pub fn emit_bank(
             entry.entry_s_offset,
             &e_env,
             &e_hle,
+            cache,
             outcome,
         );
         parts.push(src);
@@ -749,7 +756,7 @@ mod tests {
         let mut outcome = EmitOutcome::default();
         let hle = EmitHle::default();
         let s = emit_function(
-            &ctx, &rom, 0x00, 0x8000, 1, 1, None, None, 0, &env, &hle, &mut outcome,
+            &ctx, &rom, 0x00, 0x8000, 1, 1, None, None, 0, &env, &hle, None, &mut outcome,
         );
         assert!(s.contains("RecompReturn bank_00_8000_M1X1(CpuState *cpu)"));
         assert!(s.contains("cpu_write_a_m(cpu, (uint16)(_v1));"));
