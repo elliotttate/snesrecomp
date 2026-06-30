@@ -817,6 +817,13 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(jobs.max(1)).build_global().ok();
 
     let start_time = Instant::now();
+    // SF_REGEN_TIMING=1 prints per-phase wall-clock to measure optimizations.
+    let timing = std::env::var("SF_REGEN_TIMING").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    let phase = |name: &str| {
+        if timing {
+            println!("[{:7.2}s] {name}", start_time.elapsed().as_secs_f64());
+        }
+    };
     let rom = load_rom(&rom_path).expect("load rom");
     let out_dir = PathBuf::from(&out_dir);
     std::fs::create_dir_all(&out_dir).expect("mkdir out-dir");
@@ -895,6 +902,7 @@ fn main() {
     println!("Auto-detected {} JSL dispatch helpers", dispatch_helpers.len());
     let exit_fixes = exit_mx_detect_and_route(&mut parsed, &rom, &dispatch_helpers, &reloc_regions);
     println!("Auto-detecting leaf exit-(M,X) mutations... {} fix(es)", exit_fixes.len());
+    phase("autoroute (wrapper/tail/pha/dispatch-helpers/exit-mx)");
 
     // ── Promote cross-bank `name` decls into owning-bank entries (global dedup). ──
     {
@@ -1029,6 +1037,7 @@ fn main() {
     }
     let multi = variants.values().filter(|v| v.len() > 1).count();
     println!("  variants for {} targets; {} multi-(m,x)", variants.len(), multi);
+    phase("initial variant discovery");
 
     // ── callee_exit_mx from cfg directives + autoroute per-variant. ──
     let mut callee_exit_mx = rebuild_callee_exit_mx(&parsed, &variants);
@@ -1104,6 +1113,7 @@ fn main() {
     for pass_idx in 0..max_passes {
         succeeded = 0;
         failed.clear();
+        phase(&format!("emit pass {pass_idx} start"));
 
         // Variant discovery refresh from current entries.
         let mut variant_added = 0usize;
