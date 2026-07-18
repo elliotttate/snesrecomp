@@ -12,7 +12,7 @@ the generated program before making this graph authoritative for emission.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import heapq
@@ -174,23 +174,32 @@ def _target_key(site_pc24: int, raw_target: int, kind: str,
 def _stable_summary_digest(key: VariantKey, disposition: NodeDisposition,
                            instruction_rows: list, demands: Tuple[DemandEdge, ...],
                            reasons: Tuple[str, ...]) -> str:
-    payload = {
-        "key": asdict(key),
-        "disposition": disposition.value,
-        "instructions": instruction_rows,
-        "demands": [
-            {
-                "site": edge.site_pc24,
-                "kind": edge.kind.value,
-                "resolution": edge.resolution.value,
-                "target": asdict(edge.target) if edge.target else None,
-                "detail": edge.detail,
-            }
+    # This digest is an internal cache key, not a wire-format checksum.  The
+    # old implementation converted every dataclass into dictionaries and ran
+    # a full JSON encoder for every node in every exit-M/X fixed-point round.
+    # On MMX's --cfg-roots closure that consumed roughly 9% of total analysis
+    # CPU.  A tuple contains the same canonical, already-sorted facts without
+    # allocating dictionaries or sorting their keys.  repr() for these
+    # int/string/tuple/None-only values is deterministic across supported
+    # Python versions and platforms.
+    payload = (
+        (key.pc24, key.m, key.x),
+        disposition.value,
+        tuple(instruction_rows),
+        tuple(
+            (
+                edge.site_pc24,
+                edge.kind.value,
+                edge.resolution.value,
+                ((edge.target.pc24, edge.target.m, edge.target.x)
+                 if edge.target else None),
+                edge.detail,
+            )
             for edge in demands
-        ],
-        "reasons": reasons,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ),
+        tuple(reasons),
+    )
+    encoded = repr(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 

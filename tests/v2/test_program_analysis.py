@@ -43,6 +43,23 @@ def test_direct_call_closure_preserves_exact_mx_and_is_deterministic():
         "008000:M1X0", "009000:M1X0"]
 
 
+def test_node_digest_is_stable_and_changes_with_decoded_content():
+    first_rom = make_lorom_bank0({
+        0x8000: bytes([0xEA, 0x60]),       # NOP; RTS
+    })
+    changed_rom = make_lorom_bank0({
+        0x8000: bytes([0x18, 0x60]),       # CLC; RTS
+    })
+    key = VariantKey(0x008000, 1, 1)
+
+    first = ProgramAnalyzer(_decode(first_rom)).analyze([key])
+    repeated = ProgramAnalyzer(_decode(first_rom)).analyze([key])
+    changed = ProgramAnalyzer(_decode(changed_rom)).analyze([key])
+
+    assert first.nodes[key].digest == repeated.nodes[key].digest
+    assert first.nodes[key].digest != changed.nodes[key].digest
+
+
 def test_unresolved_indirect_is_per_edge_lle_and_keeps_direct_demand():
     rom = make_lorom_bank0({
         0x8000: bytes([
