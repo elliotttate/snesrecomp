@@ -1,4 +1,43 @@
-# snesrecomp-regen (Rust)
+# snesrecomp native analysis (Rust)
+
+## Current LLE-first analyzer
+
+`src/bin/analyze.rs` is the supported experiment on the current branch. It
+ports the hot whole-program variant/exit-MX fixed point while keeping the
+current Python emitter as the output authority. Its JSON uses
+`ProgramManifest` format 3, so `tools/v2_emit.py --analysis-backend native`
+can consume it directly. `auto` mode falls back to Python when a release
+binary is unavailable or fails.
+
+Build and use it with:
+
+```bash
+cd recompiler-rs
+cargo build --release --bin analyze
+cd ..
+python tools/v2_emit.py --rom game.sfc --cfg-dir recomp \
+  --out-dir src/gen --cfg-roots --analysis-backend native
+```
+
+Mega Man X static-coverage benchmark on 2026-07-18 (same machine):
+
+| Analyzer | Time | Variants | Exact exits | Mode sets |
+|---|---:|---:|---:|---:|
+| Python baseline | 402.542 s | 4,561 | 4,032 | 558 |
+| Rust native | 14.598-15.693 s | 4,561 | 4,032 | 558 |
+
+That is 25.7-27.6x faster and clears the 25x target (16.1 seconds). The AOT/LLE
+split also matches (4,551/10). `tools/v2_compare_analysis.py` checks this
+emission compatibility boundary. Diagnostic graph summaries are not yet
+byte-identical: the historical Rust decoder statically classifies some
+indirect dispatches that current Python records as runtime/LLE edges. Pass
+`--strict-summaries` to expose that remaining porting work.
+
+Using the Python baseline manifest and the native manifest to drive the same
+current Python emitter produced byte-identical generated C; only cache
+metadata and `program_manifest.json` diagnostics differed.
+
+## Historical full-regenerator port
 
 Rust port of the snesrecomp v2 static recompiler ("regen") pipeline — the thing
 that turns a ROM + per-bank `.cfg` files into one generated C file per bank, a
@@ -29,7 +68,7 @@ cargo build --release
 cargo test
 ```
 
-## Status
+## Historical status
 
 Porting in phases (bottom-up, each gated by ported tests):
 

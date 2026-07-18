@@ -127,6 +127,12 @@ pub struct FunctionDecodeGraph {
     pub const_z_folds: Vec<ConstZFold>,
     pub dispatch_targets_suppressed: Vec<DispatchTargetSuppressed>,
     pub unresolved_indirects: Vec<UnresolvedIndirect>,
+    /// Direct call sites whose continuation was deliberately truncated
+    /// because no architectural callee exit-(M,X) fact was available.
+    pub unknown_callee_exit_sites: Vec<(u32, u32, u8, u8)>,
+    /// The whole-program solver marks variants whose exit fact changed after
+    /// publication.  They remain reachable but are never eligible for AOT.
+    pub unstable_exit_fact: bool,
 }
 
 impl FunctionDecodeGraph {
@@ -190,6 +196,10 @@ pub struct DecodeEnv<'a> {
     pub inline_dispatch_loop_pcs: Option<&'a std::collections::BTreeSet<u32>>,
     /// Folded-in process-global the Python decode path read (set_global_inline_skip).
     pub global_inline_skip: Option<&'a HashMap<u32, i32>>,
+    /// LLE-first analysis must not guess that a callee preserves M/X.  Stop
+    /// the caller graph at an unknown direct call until a later fixed-point
+    /// round supplies an exact or multi-mode exit fact.
+    pub stop_on_unknown_callee_exit: bool,
 }
 
 /// `indirect_call_tables` value shape: {'base': int, 'count': int, 'kind': str}.
@@ -668,7 +678,8 @@ fn labeled_successors(
     key: &DecodeKey,
     bank: u32,
     env: &DecodeEnv,
-    rom: &[u8],
+    _rom: &[u8],
+    unknown_callee_exit_sites: &mut Vec<(u32, u32, u8, u8)>,
 ) -> Vec<(DecodeKey, &'static str)> {
     let (post_m, post_x, post_p_stack) = post_state(insn, key.m, key.x, &key.p_stack);
     let pc = insn.addr & 0xFFFF;
@@ -718,7 +729,10 @@ fn labeled_successors(
 
     if mnem == "JSR" || mnem == "JSL" {
         let (mut ret_m, mut ret_x) = (post_m, post_x);
-        let target_pc24: Option<u32> = if mnem == "JSR" && insn.length == 3 {
+        let target_pc24: Option<u32> = if mnem == "JSR"
+            && insn.length == 3
+            && insn.mode != Mode::IndirX
+        {
             Some(addr24(bank, insn.operand & 0xFFFF))
         } else if mnem == "JSL" {
             Some(insn.operand & 0xFFFFFF)
@@ -741,6 +755,7 @@ fn labeled_successors(
                 }
             }
         }
+        let mut callee_exit_known = false;
         if let Some(cem) = env.callee_exit_mx {
             if let Some(tp) = target_pc24 {
                 let mut hit = cem.get(&(tp, post_m, post_x)).copied();
@@ -753,38 +768,17 @@ fn labeled_successors(
                 if let Some((em, ex)) = hit {
                     ret_m = em & 1;
                     ret_x = ex & 1;
+                    callee_exit_known = true;
                 }
             }
         }
         if let (Some(tp), Some(cmm)) = (target_pc24, env.callee_exit_mx_modes) {
-            if (ret_m, ret_x) == (post_m, post_x) {
+            if !callee_exit_known {
                 let mut mode_set: Option<Vec<(u8, u8)>> = cmm.get(&(tp, post_m, post_x)).cloned();
                 if mode_set.is_none() {
                     let tbank = (tp >> 16) & 0xFF;
                     if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
                         mode_set = cmm.get(&(tp ^ 0x800000, post_m, post_x)).cloned();
-                    }
-                }
-                if let Some(v) = &mode_set {
-                    if v.len() > 2 {
-                        mode_set = None;
-                    }
-                }
-                if mode_set.is_some() {
-                    let reloc = env.reloc_regions.unwrap_or(&[]);
-                    let next_ins = try_rom_offset(bank, eff_next_pc, reloc).and_then(|noff| {
-                        if noff < rom.len() {
-                            decode_insn(rom, noff, eff_next_pc, bank, post_m, post_x)
-                        } else {
-                            None
-                        }
-                    });
-                    let ok = next_ins
-                        .as_ref()
-                        .map(|ni| is_cond_branch(ni.mnem))
-                        .unwrap_or(false);
-                    if !ok {
-                        mode_set = None;
                     }
                 }
                 if let Some(v) = mode_set {
@@ -809,6 +803,18 @@ fn labeled_successors(
                     }
                 }
             }
+        }
+        if env.stop_on_unknown_callee_exit && target_pc24.is_some() && !callee_exit_known {
+            let item = (
+                insn.addr & 0xFFFFFF,
+                target_pc24.unwrap(),
+                post_m & 1,
+                post_x & 1,
+            );
+            if !unknown_callee_exit_sites.contains(&item) {
+                unknown_callee_exit_sites.push(item);
+            }
+            return vec![];
         }
         return vec![(
             DecodeKey::with_stack(addr24(bank, eff_next_pc), ret_m, ret_x, post_p_stack),
@@ -1203,7 +1209,10 @@ pub fn decode_function(
                     );
                     insn.dispatch_idx_reg = Some(ud.idx_reg);
                     insn.dispatch_table_bases = ud.table_bases.clone();
-                    let mut labeled_succ = labeled_successors(&insn, &key, bank, env, rom);
+                    let mut labeled_succ = labeled_successors(
+                        &insn, &key, bank, env, rom,
+                        &mut graph.unknown_callee_exit_sites,
+                    );
                     let site_m = insn.m_flag & 1;
                     let site_x = insn.x_flag & 1;
                     for &e in &entries {
@@ -1257,7 +1266,10 @@ pub fn decode_function(
                 }
                 insn.dispatch_entries = Some(entries.clone());
                 insn.dispatch_kind = Some(kind.clone());
-                let mut labeled_succ = labeled_successors(&insn, &key, bank, env, rom);
+                let mut labeled_succ = labeled_successors(
+                    &insn, &key, bank, env, rom,
+                    &mut graph.unknown_callee_exit_sites,
+                );
                 let site_m = insn.m_flag & 1;
                 let site_x = insn.x_flag & 1;
                 for &e in &entries {
@@ -1291,7 +1303,10 @@ pub fn decode_function(
         }
 
         // Default: linear / branch / call successors.
-        let labeled_succ = labeled_successors(&insn, &key, bank, env, rom);
+        let labeled_succ = labeled_successors(
+            &insn, &key, bank, env, rom,
+            &mut graph.unknown_callee_exit_sites,
+        );
         let succ: Vec<DecodeKey> = labeled_succ.iter().map(|(k, _)| k.clone()).collect();
         graph.insert(DecodedInsn { key, insn, successors: succ });
         for (s, sk) in labeled_succ {
@@ -1497,6 +1512,73 @@ fn apply_constant_z_fold(graph: &mut FunctionDecodeGraph) {
         .collect();
 }
 
+fn direct_tail_exit_keys(
+    graph: &FunctionDecodeGraph,
+    di: &DecodedInsn,
+) -> Vec<(u32, u8, u8)> {
+    let ins = &di.insn;
+    if !matches!(ins.mnem, "JMP" | "BRA" | "BRL") {
+        return Vec::new();
+    }
+    let outside: Vec<_> = di
+        .successors
+        .iter()
+        .filter(|successor| !graph.contains(successor))
+        .map(|successor| (successor.pc & 0xFFFFFF, successor.m & 1, successor.x & 1))
+        .collect();
+    if !outside.is_empty() {
+        return outside;
+    }
+    if ins.mnem == "JMP" && ins.length == 4 && ins.dispatch_entries.is_none() {
+        return vec![(ins.operand & 0xFFFFFF, ins.m_flag & 1, ins.x_flag & 1)];
+    }
+    Vec::new()
+}
+
+fn lookup_exit_mx(
+    callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
+    pc24: u32,
+    m: u8,
+    x: u8,
+) -> Option<(u8, u8)> {
+    let map = callee_exit_mx?;
+    let key = (pc24 & 0xFFFFFF, m & 1, x & 1);
+    map.get(&key).copied().or_else(|| {
+        let bank = (pc24 >> 16) & 0xFF;
+        if bank < 0x40 || (0x80..0xC0).contains(&bank) {
+            map.get(&((pc24 ^ 0x800000) & 0xFFFFFF, m & 1, x & 1)).copied()
+        } else {
+            None
+        }
+    })
+}
+
+fn lookup_exit_mx_modes(
+    callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
+    callee_exit_mx_modes: Option<&HashMap<(u32, u8, u8), Vec<(u8, u8)>>>,
+    pc24: u32,
+    m: u8,
+    x: u8,
+) -> Option<Vec<(u8, u8)>> {
+    if let Some(exact) = lookup_exit_mx(callee_exit_mx, pc24, m, x) {
+        return Some(vec![(exact.0 & 1, exact.1 & 1)]);
+    }
+    let map = callee_exit_mx_modes?;
+    let key = (pc24 & 0xFFFFFF, m & 1, x & 1);
+    let mut result = map.get(&key).cloned().or_else(|| {
+        let bank = (pc24 >> 16) & 0xFF;
+        if bank < 0x40 || (0x80..0xC0).contains(&bank) {
+            map.get(&((pc24 ^ 0x800000) & 0xFFFFFF, m & 1, x & 1)).cloned()
+        } else {
+            None
+        }
+    })?;
+    result.iter_mut().for_each(|pair| *pair = (pair.0 & 1, pair.1 & 1));
+    result.sort();
+    result.dedup();
+    Some(result)
+}
+
 /// Exit (m, x) meet across a function's return paths; (None, None) if ambiguous.
 /// Port of `analyze_function_exit_mx`.
 pub fn analyze_function_exit_mx(
@@ -1544,6 +1626,26 @@ pub fn analyze_function_exit_mx(
                 &mut m_ambig,
                 &mut x_ambig,
             );
+            continue;
+        }
+        let tail_keys = direct_tail_exit_keys(graph, di);
+        if !tail_keys.is_empty() {
+            for (target, site_m, site_x) in tail_keys {
+                let Some((em, ex)) = lookup_exit_mx(
+                    callee_exit_mx, target, site_m, site_x,
+                ) else {
+                    return (None, None);
+                };
+                accumulate(
+                    em & 1,
+                    ex & 1,
+                    &mut exit_m,
+                    &mut exit_x,
+                    &mut have_any,
+                    &mut m_ambig,
+                    &mut x_ambig,
+                );
+            }
             continue;
         }
         let is_dispatch_term = ins.dispatch_entries.is_some()
@@ -1601,6 +1703,16 @@ pub fn analyze_function_exit_mx_modes(
     graph: &FunctionDecodeGraph,
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
 ) -> Option<Vec<(u8, u8)>> {
+    analyze_function_exit_mx_modes_with_sets(graph, callee_exit_mx, None)
+}
+
+/// Concrete exit states with exact and multi-mode callee facts composed
+/// through direct tail chains and dispatch terminators.
+pub fn analyze_function_exit_mx_modes_with_sets(
+    graph: &FunctionDecodeGraph,
+    callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
+    callee_exit_mx_modes: Option<&HashMap<(u32, u8, u8), Vec<(u8, u8)>>>,
+) -> Option<Vec<(u8, u8)>> {
     let mut modes: HashSet<(u8, u8)> = HashSet::new();
     for di in graph.insns() {
         let ins = &di.insn;
@@ -1608,11 +1720,23 @@ pub fn analyze_function_exit_mx_modes(
             modes.insert((ins.m_flag & 1, ins.x_flag & 1));
             continue;
         }
+        let tail_keys = direct_tail_exit_keys(graph, di);
+        if !tail_keys.is_empty() {
+            for (target, site_m, site_x) in tail_keys {
+                modes.extend(lookup_exit_mx_modes(
+                    callee_exit_mx,
+                    callee_exit_mx_modes,
+                    target,
+                    site_m,
+                    site_x,
+                )?);
+            }
+            continue;
+        }
         let is_dispatch_term = ins.dispatch_entries.is_some()
             && di.successors.is_empty()
             && (ins.mnem == "JSL" || ins.mnem == "JMP");
         if is_dispatch_term {
-            let cem = callee_exit_mx?;
             let site_m = ins.m_flag & 1;
             let site_x = ins.x_flag & 1;
             let dispatcher_bank = (ins.addr >> 16) & 0xFF;
@@ -1626,8 +1750,13 @@ pub fn analyze_function_exit_mx_modes(
                 } else {
                     (dispatcher_bank << 16) | (entry & 0xFFFF)
                 };
-                let handler_exit = cem.get(&(tgt_pc24, site_m, site_x))?;
-                modes.insert((handler_exit.0 & 1, handler_exit.1 & 1));
+                modes.extend(lookup_exit_mx_modes(
+                    callee_exit_mx,
+                    callee_exit_mx_modes,
+                    tgt_pc24,
+                    site_m,
+                    site_x,
+                )?);
             }
         }
     }
@@ -1880,7 +2009,10 @@ impl DecodeCache {
         {
             let map = self.map.lock().unwrap();
             if let Some(bucket) = map.get(&base) {
-                for e in bucket {
+                // Exit facts grow monotonically, so the newest dependency
+                // snapshot is overwhelmingly the likely hit on the next
+                // fixed-point round.
+                for e in bucket.iter().rev() {
                     if decode_deps_match(&e.cem_deps, &e.cmm_deps, &e.sib_deps, env) {
                         self.hits.fetch_add(1, Ordering::Relaxed);
                         return e.graph.clone();
@@ -1898,6 +2030,57 @@ impl DecodeCache {
             graph: g.clone(),
         });
         g
+    }
+
+    /// Sequential fast path for analysis.  It avoids taking the cache mutex
+    /// 170k+ times while retaining the exact same dependency validation as
+    /// `get_or_decode`.  Parallel emit continues to use the thread-safe API.
+    pub fn get_or_decode_local(
+        &mut self,
+        rom: &[u8],
+        bank: u32,
+        start: u32,
+        m: u8,
+        x: u8,
+        end: Option<u32>,
+        env: &DecodeEnv,
+    ) -> Arc<FunctionDecodeGraph> {
+        let m = m & 1;
+        let x = x & 1;
+        let base: CacheBase = (
+            bank & 0xFF,
+            start & 0xFFFF,
+            m,
+            x,
+            end,
+            env.callee_exit_mx.is_some(),
+        );
+        {
+            let map = self.map.get_mut().unwrap();
+            if let Some(bucket) = map.get(&base) {
+                for entry in bucket.iter().rev() {
+                    if decode_deps_match(
+                        &entry.cem_deps,
+                        &entry.cmm_deps,
+                        &entry.sib_deps,
+                        env,
+                    ) {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return entry.graph.clone();
+                    }
+                }
+            }
+        }
+        let graph = Arc::new(decode_function(rom, bank, start, m, x, end, env));
+        let (cem_deps, cmm_deps, sib_deps) = compute_deps(&graph, env);
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.map.get_mut().unwrap().entry(base).or_default().push(DecodeCacheEntry {
+            cem_deps,
+            cmm_deps,
+            sib_deps,
+            graph: graph.clone(),
+        });
+        graph
     }
 }
 

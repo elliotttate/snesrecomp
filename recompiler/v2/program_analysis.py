@@ -161,6 +161,72 @@ class ProgramManifest:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+    @classmethod
+    def from_dict(cls, value: Mapping) -> "ProgramManifest":
+        """Load the stable manifest wire format from any analyzer backend."""
+        version = int(value.get("format_version", 0))
+        if version != 3:
+            raise ValueError(
+                f"unsupported program manifest format_version={version}")
+
+        def parse_key(item) -> VariantKey:
+            return VariantKey(
+                int(item["pc24"]), int(item["m"]), int(item["x"]))
+
+        def parse_manifest_key(text: str) -> VariantKey:
+            try:
+                address, modes = text.split(":", 1)
+                return VariantKey(
+                    int(address, 16), int(modes[1]), int(modes[3]))
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid manifest variant key {text!r}") \
+                    from exc
+
+        nodes = {}
+        for text_key, item in value.get("nodes", {}).items():
+            key = parse_key(item["key"])
+            if key != parse_manifest_key(text_key):
+                raise ValueError(
+                    f"manifest node key mismatch for {text_key!r}")
+            demands = []
+            for edge in item.get("demands", ()):
+                demands.append(DemandEdge(
+                    site_pc24=int(edge["site_pc24"]),
+                    kind=EdgeKind(edge["kind"]),
+                    resolution=EdgeResolution(edge["resolution"]),
+                    target=(parse_key(edge["target"])
+                            if edge.get("target") is not None else None),
+                    detail=str(edge.get("detail", "")),
+                ))
+            nodes[key] = NodeSummary(
+                key=key,
+                disposition=NodeDisposition(item["disposition"]),
+                instruction_count=int(item["instruction_count"]),
+                min_pc24=int(item["min_pc24"]),
+                max_pc24=int(item["max_pc24"]),
+                demands=tuple(demands),
+                reasons=tuple(str(reason)
+                              for reason in item.get("reasons", ())),
+                digest=str(item.get("digest", "")),
+            )
+        exit_modes = {
+            parse_manifest_key(text_key): (int(item["m"]), int(item["x"]))
+            for text_key, item in value.get("exit_modes", {}).items()
+        }
+        exit_mode_sets = {
+            parse_manifest_key(text_key): frozenset(
+                (int(item["m"]), int(item["x"])) for item in mode_set)
+            for text_key, mode_set in value.get("exit_mode_sets", {}).items()
+        }
+        return cls(
+            roots=tuple(sorted(parse_key(item)
+                               for item in value.get("roots", ()))),
+            nodes=nodes,
+            exit_modes=exit_modes,
+            exit_mode_sets=exit_mode_sets,
+            format_version=version,
+        )
+
 
 def _target_key(site_pc24: int, raw_target: int, kind: str,
                 m: int, x: int) -> VariantKey:
