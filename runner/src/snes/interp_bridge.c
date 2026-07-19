@@ -1235,6 +1235,12 @@ extern int snes_frame_counter;
 static long s_tier_hits = 0;
 long interp_tier_hit_count(void) { return s_tier_hits; }
 
+/* Aggregate tier-2 coverage stats for the interp_stats TCP command:
+ * distinct interp gap sites and summed clean/bail hits across the table.
+ * Defined after g_tier2_cov below; forward the totals here. */
+void interp_tier2_stats(int *sites, unsigned long long *clean,
+                        unsigned long long *bail);
+
 /* Bounded observability: a coverage-gap tier-down is an event worth seeing.
  * First N go to stderr (matching the existing dispatch_oob single-line style);
  * the counter is always live for the manifest (Phase 2) and tests. */
@@ -1271,6 +1277,18 @@ typedef struct {
 static Tier2CovSite g_tier2_cov[TIER2_COVERAGE_MAX];
 static int          g_tier2_cov_count;
 static uint64_t     g_tier2_cov_overflow;
+
+void interp_tier2_stats(int *sites, unsigned long long *clean,
+                        unsigned long long *bail) {
+    unsigned long long c = 0, b = 0;
+    for (int i = 0; i < g_tier2_cov_count; i++) {
+        c += g_tier2_cov[i].clean_hits;
+        b += g_tier2_cov[i].bail_hits;
+    }
+    if (sites) *sites = g_tier2_cov_count;
+    if (clean) *clean = c;
+    if (bail)  *bail  = b;
+}
 
 static const char *tier2_mx_str(uint8_t mx);
 static const char *tier2_kind_str(uint8_t k);
