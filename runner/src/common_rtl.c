@@ -813,6 +813,63 @@ void rtl_accumulate_apu_catchup(void) {
   }
 }
 
+static bool rtl_apu_ports_are_immediate(void) {
+  static int immediate = -1;
+  if (immediate < 0) {
+    const char *setting = getenv("SNESRECOMP_APU_IMMEDIATE_PORTS");
+    immediate = (setting && setting[0]) ? (setting[0] != '0') : 1;
+#ifdef SNES_COSIM
+    /* Deferred targets use a host-time clock and cannot preserve the shared
+     * co-sim clock's cross-tier byte ordering. */
+    if (cosim_apu_shared_clock())
+      immediate = 1;
+#endif
+  }
+  return immediate != 0;
+}
+
+static void rtl_schedule_deferred_apu_write(uint8_t port, uint8_t val) {
+  static uint64_t port_clock;
+  static uint64_t port_clock_ns;
+  static uint64_t last_target[4];
+  static uint8_t last_val[4];
+  static uint8_t last_valid[4];
+
+  uint64_t quantum = audio_trace_consume_quantum();
+  uint64_t now_ns = audio_trace_wall_ns();
+  uint64_t produced;
+  audio_trace_sample_clocks(&produced, NULL);
+
+  uint64_t delta = 0;
+  if (port_clock_ns != 0)
+    delta = (now_ns - port_clock_ns) * 32040u / 1000000000u;
+  if (delta > 4u * quantum)
+    delta = 4u * quantum;
+
+  uint64_t target = port_clock + delta;
+  if (target < produced)
+    target = produced;
+  if (target > produced + 3u * quantum)
+    target = produced + 3u * quantum;
+
+  /* SMW presents one-frame commands which can otherwise be replaced before
+   * its SPC driver polls the port. Keep distinct values at least two observed
+   * poll periods apart in the opt-in deferred mode. */
+  if (last_valid[port] && val != last_val[port]) {
+    uint64_t floor = last_target[port] + APU_PORT_MIN_DWELL;
+    uint64_t ceiling = produced + 8u * quantum;
+    if (target < floor)
+      target = floor < ceiling ? floor : ceiling;
+  }
+
+  last_target[port] = target;
+  last_val[port] = val;
+  last_valid[port] = 1;
+  port_clock = target;
+  port_clock_ns = now_ns;
+  apu_schedulePortWrite(g_snes->apu, port, val, target);
+}
+
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
 #ifdef SNES_COSIM
@@ -832,8 +889,12 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   RtlApuLock();
   rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
-  audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
-  apu_writePortNow(g_snes->apu, (uint8_t)(adr & 0x3), val);
+  uint8_t port = (uint8_t)(adr & 0x3);
+  audio_trace_on_cpu_port_write(port, val);
+  if (rtl_apu_ports_are_immediate())
+    apu_writePortNow(g_snes->apu, port, val);
+  else
+    rtl_schedule_deferred_apu_write(port, val);
   RtlApuUnlock();
 }
 
@@ -848,6 +909,10 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
 
   RtlApuLock();
   bool ipl_phase = g_snes->apu->romReadable;
+  /* Deferred game commands must not arrive in the middle of the HLE-owned
+   * transfer. Apply their final bus state now, then preserve the live request
+   * value below while taking ownership of the protocol. */
+  apu_flushPortQueueNow(g_snes->apu);
   uint8_t transfer_request = g_snes->apu->inPorts[1];
   if (!ipl_phase &&
       !apu_waitForTransferReady(g_snes->apu, 1, transfer_request, 1u << 20)) {

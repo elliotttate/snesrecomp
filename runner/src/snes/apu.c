@@ -24,6 +24,7 @@ Apu* apu_init(void) {
   Apu* apu = calloc(1, sizeof(Apu));  /* zero padding: saveload/co-sim hash determinism */
   apu->spc = spc_init(apu);
   apu->dsp = dsp_init(apu->ram);
+  apu_clearPortQueue(apu);
   return apu;
 }
 
@@ -50,12 +51,58 @@ void apu_reset(Apu* apu) {
     apu->timer[i].enabled = false;
   }
   apu->cpuCyclesLeft = 7;
+  apu_clearPortQueue(apu);
 }
 
 void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val) {
   port &= 3;
   apu->inPorts[port] = val;
   audio_trace_on_cpu_port_apply(port, val);
+}
+
+void apu_clearPortQueue(Apu* apu) {
+  apu->portQHead = apu->portQTail = 0;
+}
+
+static void apu_applyPortWrite(Apu* apu, const ApuPortWrite *write) {
+  apu_writePortNow(apu, write->port, write->val);
+}
+
+void apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
+                           uint64_t target_sample) {
+  if (apu->portQTail - apu->portQHead >= APU_PORT_QUEUE_LEN) {
+    /* Preserve global ordering if the bounded experimental queue fills. */
+    apu_applyPortWrite(
+        apu, &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)]);
+    apu->portQHead++;
+  }
+  ApuPortWrite *write =
+      &apu->portQueue[apu->portQTail & (APU_PORT_QUEUE_LEN - 1)];
+  write->target_sample = target_sample;
+  write->port = (uint8_t)(port & 3);
+  write->val = val;
+  apu->portQTail++;
+}
+
+void apu_flushPortQueueNow(Apu* apu) {
+  while (apu->portQHead != apu->portQTail) {
+    apu_applyPortWrite(
+        apu, &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)]);
+    apu->portQHead++;
+  }
+}
+
+static void apu_drainPortQueue(Apu* apu) {
+  uint64_t produced;
+  audio_trace_sample_clocks(&produced, NULL);
+  while (apu->portQHead != apu->portQTail) {
+    ApuPortWrite *write =
+        &apu->portQueue[apu->portQHead & (APU_PORT_QUEUE_LEN - 1)];
+    if (write->target_sample > produced)
+      break;
+    apu_applyPortWrite(apu, write);
+    apu->portQHead++;
+  }
 }
 
 bool apu_waitForTransferReady(Apu* apu, uint8_t request_port,
@@ -109,6 +156,7 @@ void apu_cycle(Apu* apu) {
 
   if((apu->cycles & 0x1f) == 0) {
     // every 32 cycles
+    apu_drainPortQueue(apu);
     dsp_cycle(apu->dsp);
   }
 

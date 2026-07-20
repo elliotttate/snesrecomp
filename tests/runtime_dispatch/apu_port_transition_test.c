@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "apu.h"
+#include "dsp_shadow.h"
 
 static int applied_count;
 static uint8_t applied_port;
@@ -13,6 +14,39 @@ void audio_trace_on_cpu_port_apply(uint8_t port, uint8_t value) {
   applied_count++;
   applied_port = port;
   applied_value = value;
+}
+
+/* Standalone-link stubs for core paths which the zero-cycle handshake checks
+ * do not execute. Keeping these here lets the checked-in runner compile and
+ * execute this test instead of leaving it as an unregistered source file. */
+void audio_trace_on_spc_port_read(uint8_t port, uint8_t value) {
+  (void)port; (void)value;
+}
+void audio_trace_on_spc_port_write(uint8_t port, uint8_t value) {
+  (void)port; (void)value;
+}
+void audio_trace_on_sample(int16_t left, int16_t right, int dropped,
+                           uint32_t ring_fill) {
+  (void)left; (void)right; (void)dropped; (void)ring_fill;
+}
+void audio_trace_on_reg_write(uint8_t address, uint8_t value) {
+  (void)address; (void)value;
+}
+void audio_trace_on_consume(uint64_t read_index, uint32_t count,
+                            uint32_t available_after) {
+  (void)read_index; (void)count; (void)available_after;
+}
+void audio_trace_sample_clocks(uint64_t *produced, uint64_t *consumed) {
+  if (produced) *produced = 0;
+  if (consumed) *consumed = 0;
+}
+DspShadow *dsp_shadow_create(void) { return NULL; }
+void dsp_shadow_free(DspShadow *shadow) { (void)shadow; }
+void dsp_shadow_process(DspShadow *shadow, Dsp *dsp, int canonical_left,
+                        int canonical_right, int *out_left, int *out_right) {
+  (void)shadow; (void)dsp;
+  *out_left = canonical_left;
+  *out_right = canonical_right;
 }
 
 static int check(int condition, const char *message) {
@@ -42,6 +76,23 @@ int main(void) {
   failures += check(apu.inPorts[2] == 0x00 && applied_port == 2 &&
                     applied_value == 0x00,
                     "port index is masked and clear is immediately visible");
+
+  memset(&apu, 0, sizeof(apu));
+  applied_count = 0;
+  apu_schedulePortWrite(&apu, 2, 0x80, 100);
+  apu_schedulePortWrite(&apu, 2, 0x23, 200);
+  failures += check(apu.inPorts[2] == 0 && applied_count == 0,
+                    "deferred commands remain hidden until APU time advances");
+  apu_flushPortQueueNow(&apu);
+  failures += check(apu.inPorts[2] == 0x23 && applied_count == 2 &&
+                    apu.portQHead == apu.portQTail,
+                    "HLE takeover preserves queued ordering and final bus state");
+
+  apu_schedulePortWrite(&apu, 2, 0x45, 300);
+  apu_clearPortQueue(&apu);
+  apu_flushPortQueueNow(&apu);
+  failures += check(apu.inPorts[2] == 0x23 && applied_count == 2,
+                    "queue clear discards stale post-reset commands");
 
   memset(&apu, 0, sizeof(apu));
   apu.outPorts[0] = 0xaa;
