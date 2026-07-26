@@ -103,6 +103,11 @@ typedef struct ParallaxSettings {
   int distance_x100;    /* camera distance * 100; 0 = auto-fit the frame */
   int depth_shade;      /* 0..100, how strongly far layers are tinted */
   int layer_gap;        /* 0..200, scales every plane's depth offset */
+  /* How strongly the camera leans into the game's own scroll motion
+   * (Parallax_ReportCameraMotion), 0..200 where 100 is the tuned default.
+   * 0 pins the camera and — with `fill` on — makes the whole effect visually
+   * inert, so treat 0 as "off", not "subtle". */
+  int sway;
   bool shadows;         /* per-layer offset silhouette */
   bool smooth;          /* supersampled premultiplied edge AA */
   /* Scale each plane by its depth so every layer still fills the frame
@@ -173,6 +178,25 @@ void Parallax_LetterboxViewport(int out_w, int out_h, int frame_w,
  * config persistence sees the change. */
 void Parallax_AdjustCamera(float d_yaw, float d_pitch, float d_zoom);
 void Parallax_ResetCamera(void);
+
+/* Report this frame's camera motion, in SNES pixels, so the presenter can lean
+ * the render camera into it.
+ *
+ * This is the difference between the effect working and being visually inert.
+ * With depth-compensated sizing ("fill") and a STATIC camera, every plane
+ * subtends the same screen area and the composite collapses to the flat frame
+ * plus a keystone — the layers cannot be told apart. Differential motion is the
+ * cue that actually reads as depth: leaning the camera by a fraction of the
+ * game's own scroll makes near planes sweep further across the screen than far
+ * ones, which is exactly what a multiplane camera does.
+ *
+ * A game passes its per-frame camera delta (dx, dy) — typically the change in
+ * whichever BG scroll register or WRAM camera drives its playfield. Sign
+ * convention: positive dx = the view moving right. Call once per frame from the
+ * same place as Parallax_PrepareFrame; pass 0,0 on a frame with no meaningful
+ * delta (scene change, warp, load) so a discontinuity is not mistaken for a
+ * huge camera sweep. */
+void Parallax_ReportCameraMotion(float dx_px, float dy_px);
 
 /* Suggested per-pixel drag sensitivity and per-notch zoom step, so every
  * game's mouse/gamepad binding feels the same. */

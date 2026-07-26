@@ -69,6 +69,7 @@ ParallaxSettings g_parallax = {
   .distance_x100 = 0,     /* auto-fit */
   .depth_shade = 55,
   .layer_gap = 100,
+  .sway = 100,
   .shadows = true,
   .smooth = true,
   .fill = true,
@@ -89,6 +90,24 @@ static SDL_BlendMode s_premultiplied;
 static bool s_premultiplied_ready;
 static float s_auto_distance = 5.0f;
 static int s_bound_pitch;              /* pitch the surfaces are bound at */
+
+/* Scroll-driven camera lean (see Parallax_ReportCameraMotion). s_lean_* are the
+ * smoothed, decaying yaw/pitch offsets actually applied to the render camera. */
+static float s_lean_yaw, s_lean_pitch;
+
+/* Radians of lean per SNES pixel of camera motion per frame, at sway=100.
+ * Sized so ordinary walking speed (~1-2 px/frame) produces a lean that is
+ * clearly legible without the world appearing to swing. */
+static const float kParallaxLeanRadPerPx = 0.030f;
+/* Cap so a screen transition or warp that slips past the caller's own
+ * discontinuity check cannot whip the camera to the clamp. */
+static const float kParallaxLeanMax = 0.22f;
+/* Per-frame decay toward centre when motion stops. Slow enough to glide, fast
+ * enough that the world settles rather than drifting. */
+static const float kParallaxLeanDecay = 0.90f;
+/* Smoothing of the incoming delta, so single-frame scroll jitter (HDMA-driven
+ * layers, sub-pixel camera rounding) does not read as a twitch. */
+static const float kParallaxLeanSmooth = 0.25f;
 
 static float Clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
@@ -158,7 +177,27 @@ void Parallax_AdjustCamera(float d_yaw, float d_pitch, float d_zoom) {
   }
 }
 
+void Parallax_ReportCameraMotion(float dx_px, float dy_px) {
+  float gain = (float)g_parallax.sway / 100.0f;
+  if (gain <= 0.0f) {
+    s_lean_yaw = s_lean_pitch = 0.0f;
+    return;
+  }
+  /* Target lean for this frame's motion, then a low-pass toward it. The decay
+   * is applied to the target (not the state) so a frame with no motion pulls
+   * the lean back toward centre instead of freezing it where it was. */
+  float target_yaw = Clampf(dx_px * kParallaxLeanRadPerPx * gain,
+                            -kParallaxLeanMax, kParallaxLeanMax);
+  float target_pitch = Clampf(dy_px * kParallaxLeanRadPerPx * gain,
+                              -kParallaxLeanMax, kParallaxLeanMax);
+  s_lean_yaw += (target_yaw - s_lean_yaw) * kParallaxLeanSmooth;
+  s_lean_pitch += (target_pitch - s_lean_pitch) * kParallaxLeanSmooth;
+  s_lean_yaw *= kParallaxLeanDecay;
+  s_lean_pitch *= kParallaxLeanDecay;
+}
+
 void Parallax_ResetCamera(void) {
+  s_lean_yaw = s_lean_pitch = 0.0f;
   g_parallax.tilt_x_mrad = 120;
   g_parallax.tilt_y_mrad = 0;
   g_parallax.distance_x100 = 0;
@@ -684,9 +723,13 @@ bool Parallax_Composite(SDL_Renderer *renderer, const SDL_Rect *viewport,
   s_auto_distance =
       fmaxf(fit_h, fit_w) * 1.02f + (near_z - kParallaxFocalZ) * gap;
 
+  /* The authored pose plus this frame's scroll-driven lean. The lean is added
+   * here, at consume time, and never written back into g_parallax — it is
+   * transient render state, not an authored setting, and persisting it would
+   * slowly walk the user's camera away from where they put it. */
   Scene3DCamera cam = {
-    (float)g_parallax.tilt_x_mrad / 1000.0f,
-    (float)g_parallax.tilt_y_mrad / 1000.0f,
+    (float)g_parallax.tilt_x_mrad / 1000.0f + s_lean_pitch,
+    (float)g_parallax.tilt_y_mrad / 1000.0f + s_lean_yaw,
     g_parallax.distance_x100 > 0
         ? (float)g_parallax.distance_x100 / 100.0f : s_auto_distance,
     kParallaxFovY,
