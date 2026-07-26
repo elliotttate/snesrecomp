@@ -17,6 +17,10 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/common_cpu_infra.c
     ${SNESRECOMP_RUNNER_ROOT}/src/common_rtl.c
     ${SNESRECOMP_RUNNER_ROOT}/src/widescreen.c
+    # Layered pseudo-3D parallax presenter (docs/PARALLAX.md). Inert unless a
+    # game installs a ParallaxProfile and sets g_parallax.enabled.
+    ${SNESRECOMP_RUNNER_ROOT}/src/parallax.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/scene3d_math.c
     ${SNESRECOMP_RUNNER_ROOT}/src/recomp_hw.c
     ${SNESRECOMP_RUNNER_ROOT}/src/framedump.c
     ${SNESRECOMP_RUNNER_ROOT}/src/launcher.c

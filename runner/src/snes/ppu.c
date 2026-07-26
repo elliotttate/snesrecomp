@@ -22,6 +22,13 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line);
 static uint16_t ppu_getVramRemap(Ppu* ppu);
 
 
+/* overlayRenderMaybeDirty[] is a countdown of frames that must still be
+ * cleared, not a bool: 2 is the smallest value that guarantees exactly ONE
+ * full clearing frame after the last frame that wrote content (the countdown
+ * is decremented at a frame's first line, then tested for the rest of it —
+ * see PpuClearOverlayRenderLine). */
+enum { kPpuOverlayDirtyFrames = 2 };
+
 Ppu* ppu_init(void) {
   Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
   return ppu;
@@ -38,14 +45,22 @@ void ppu_reset(Ppu* ppu) {
     uint32_t renderFlags = ppu->renderFlags;
     uint32_t overlayPitch[kPpuOverlaySource_Count];
     uint8_t *overlayBuffer[kPpuOverlaySource_Count];
+    uint8_t *overlayBands[kPpuOverlaySource_Count][3];
     memcpy(overlayPitch, ppu->overlayRenderPitch, sizeof(overlayPitch));
     memcpy(overlayBuffer, ppu->overlayRenderBuffer, sizeof(overlayBuffer));
+    memcpy(overlayBands, ppu->overlayRenderBands, sizeof(overlayBands));
     memset(ppu, 0, sizeof(*ppu));
     ppu->renderBuffer = renderBuffer;
     ppu->renderPitch = (uint32_t)pitch;
     ppu->renderFlags = renderFlags;
     memcpy(ppu->overlayRenderPitch, overlayPitch, sizeof(overlayPitch));
     memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
+    memcpy(ppu->overlayRenderBands, overlayBands, sizeof(overlayBands));
+    /* A surviving caller buffer has unknown contents after the reset, so every
+     * bound surface starts dirty and gets one honest clearing pass. */
+    for (int i = 0; i < kPpuOverlaySource_Count; i++)
+      ppu->overlayRenderMaybeDirty[i] =
+          ppu->overlayRenderBuffer[i] ? kPpuOverlayDirtyFrames : 0;
   }
   ppu->vramIncrement = 1;
 }
@@ -91,6 +106,8 @@ void PpuClearOverlayCaptures(Ppu *ppu) {
 void PpuClearOverlayBindings(Ppu *ppu) {
   memset(ppu->overlayRenderBuffer, 0, sizeof(ppu->overlayRenderBuffer));
   memset(ppu->overlayRenderPitch, 0, sizeof(ppu->overlayRenderPitch));
+  memset(ppu->overlayRenderBands, 0, sizeof(ppu->overlayRenderBands));
+  memset(ppu->overlayRenderMaybeDirty, 0, sizeof(ppu->overlayRenderMaybeDirty));
   PpuClearOverlayCaptures(ppu);
 }
 
@@ -103,9 +120,28 @@ bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
     return false;
   ppu->overlayRenderBuffer[source] = pixels;
   ppu->overlayRenderPitch[source] = pixels ? (uint32_t)pitch : 0;
+  /* A primary rebind invalidates its band family: bands share the primary's
+   * pitch, so a band held across a pitch change would be written with the
+   * wrong stride. Callers bind bands AFTER their primary, every frame. */
+  memset(ppu->overlayRenderBands[source], 0,
+         sizeof(ppu->overlayRenderBands[source]));
+  /* Caller-provided buffer contents are unknown, so assume dirty. */
+  ppu->overlayRenderMaybeDirty[source] =
+      pixels ? kPpuOverlayDirtyFrames : 0;
   if (!pixels)
     memset(&ppu->overlayCaptures[source], 0,
            sizeof(ppu->overlayCaptures[source]));
+  return true;
+}
+
+bool PpuBindOverlayPrioSurface(Ppu *ppu, PpuOverlaySource source, int band,
+                               uint8_t *pixels) {
+  if ((unsigned)source >= kPpuOverlaySource_Count || band < 1 || band > 3 ||
+      (pixels && !ppu->overlayRenderBuffer[source]))
+    return false;
+  ppu->overlayRenderBands[source][band - 1] = pixels;
+  if (pixels)
+    ppu->overlayRenderMaybeDirty[source] = kPpuOverlayDirtyFrames;
   return true;
 }
 
@@ -1459,14 +1495,39 @@ static uint32 PpuOverlayColor(Ppu *ppu, PpuZbufType pixel) {
       ppu->brightnessMult[(color >> 10) & 0x1f];
 }
 
+/* Captures are per-frame game policy fixed before scanout, so a surface whose
+ * capture is inactive receives no writes this frame. Skip its per-line clear
+ * when it is already all-transparent (the usual case); a surface written last
+ * frame is cleared for one more full frame, then its dirty flag drops on the
+ * final line. Without this, merely BINDING surfaces (as a parallax-capable
+ * game does once at startup) would cost 5 full-width memsets per scanline
+ * forever, whether or not the feature is switched on. */
 static void PpuClearOverlayRenderLine(Ppu *ppu, uint y) {
   if (y == 0) return;
   int screen_y = (int)y - 1;
+  bool frame_start = screen_y == 0;
   for (int source = 0; source < kPpuOverlaySource_Count; source++) {
     uint8_t *pixels = ppu->overlayRenderBuffer[source];
     uint32_t pitch = ppu->overlayRenderPitch[source];
-    if (pixels && pitch)
-      memset(pixels + (size_t)screen_y * pitch, 0, pitch);
+    if (!pixels || !pitch)
+      continue;
+    const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+    bool active = capture->x1 > capture->x0 && capture->y1 > capture->y0;
+    /* The countdown is decremented once per frame, at the frame's first line,
+     * rather than retired on a hardcoded last line: this PPU renders 224- OR
+     * 240-line frames (kPpuRenderFlags_Height240), and retiring the flag at
+     * line 223 would leave rows 224..239 skipped-but-stale on the following
+     * frame. Anchoring to line 0 is height-agnostic. */
+    if (frame_start && !active && ppu->overlayRenderMaybeDirty[source])
+      ppu->overlayRenderMaybeDirty[source]--;
+    if (!active && !ppu->overlayRenderMaybeDirty[source])
+      continue;
+    memset(pixels + (size_t)screen_y * pitch, 0, pitch);
+    for (int band = 0; band < 3; band++) {
+      uint8_t *band_pixels = ppu->overlayRenderBands[source][band];
+      if (band_pixels)
+        memset(band_pixels + (size_t)screen_y * pitch, 0, pitch);
+    }
   }
 }
 
@@ -1489,12 +1550,58 @@ static void PpuWriteOverlayRenderLine(Ppu *ppu, PpuOverlaySource source,
       x1 + kPpuExtraLeftRight > kPpuBufWidth)
     return;
 
+  /* Content is about to land in this surface, so it must keep being cleared
+   * for a frame after the capture stops (see kPpuOverlayDirtyFrames). */
+  ppu->overlayRenderMaybeDirty[source] = kPpuOverlayDirtyFrames;
+
   uint32 *dst = (uint32 *)(ppu->overlayRenderBuffer[source] +
                             (size_t)screen_y * pitch);
   const PpuZbufType *src = ppu->overlayBuffers[source].data;
-  for (int x = x0; x < x1; x++)
-    dst[x + texture_extra] =
-        PpuOverlayColor(ppu, src[x + kPpuExtraLeftRight]);
+
+  uint32 *band_dst[3] = { NULL, NULL, NULL };
+  bool any_bands = false;
+  for (int band = 0; band < 3; band++) {
+    uint8_t *base = ppu->overlayRenderBands[source][band];
+    if (base) {
+      band_dst[band] = (uint32 *)(base + (size_t)screen_y * pitch);
+      any_bands = true;
+    }
+  }
+  if (!any_bands) {
+    for (int x = x0; x < x1; x++)
+      dst[x + texture_extra] =
+          PpuOverlayColor(ppu, src[x + kPpuExtraLeftRight]);
+    return;
+  }
+
+  /* Priority-split resolve: route each captured pixel to the band surface
+   * matching its hardware priority. The z top byte carries the Mode-1 rank
+   * (see the PpuDrawBackgrounds table above): for OBJ the top two bits ARE the
+   * OAM priority (SPRITE_PRIO_TO_PRIO), for a BG layer one threshold separates
+   * its two tile-priority ranks. Lines were pre-cleared, so only real pixels
+   * need writes and every surface gets each pixel exactly once. */
+  static const uint8 kBgHiPrioMin[kPpuOverlaySource_Count] = {
+    0xc0,  /* BG1: hi z 0xc0.., lo 0x80.. (mode 1) */
+    0xb1,  /* BG2: hi z 0xb1.., lo 0x71.. */
+    0x32,  /* BG3: hi z 0xf2../0x32.. (either $2105 variant), lo 0x12.. */
+    0xff,  /* BG4: never rendered by the overlay-capable paths (modes 1/7) */
+    0x00,  /* OBJ routes by the top two bits instead */
+  };
+  for (int x = x0; x < x1; x++) {
+    PpuZbufType zp = src[x + kPpuExtraLeftRight];
+    uint32 color = PpuOverlayColor(ppu, zp);
+    if (!color)
+      continue;
+    uint32 *out = dst;
+    if (source == kPpuOverlaySource_Obj) {
+      int band = zp >> 14;
+      if (band > 0 && band_dst[band - 1])
+        out = band_dst[band - 1];
+    } else if (band_dst[0] && (zp >> 8) >= kBgHiPrioMin[source]) {
+      out = band_dst[0];
+    }
+    out[x + texture_extra] = color;
+  }
 }
 
 // Choose the destination priority buffer for a background layer. When the
