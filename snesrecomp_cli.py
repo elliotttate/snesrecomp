@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import pathlib
 import re
@@ -25,6 +24,14 @@ for path in (ROOT, ROOT / "recompiler", ROOT / "tools"):
 
 from snes65816 import detect_rom_mapping, load_rom  # noqa: E402
 from tools import v2_emit  # noqa: E402
+from tools.sdk_generate import (  # noqa: E402
+    EXIT_ERROR,
+    add_generate_parser,
+    add_verify_parser,
+    run_tool,
+)
+from tools.sdk_progress import ProgressReporter  # noqa: E402
+from tools.sdk_rom import RomVerifyError, verify_rom  # noqa: E402
 
 
 def safe_name(value: str) -> str:
@@ -41,31 +48,14 @@ def write_text(path: pathlib.Path, contents: str) -> None:
     path.write_text(contents, encoding="utf-8", newline="\n")
 
 
-def run_tool(tool, arguments: list[str]) -> int:
-    original = sys.argv
-    try:
-        sys.argv = [tool.__file__, *arguments]
-        try:
-            result = tool.main()
-        except SystemExit as exc:
-            result = exc.code
-        return int(result or 0)
-    finally:
-        sys.argv = original
-
-
 def build_project(args: argparse.Namespace) -> int:
     rom_path = pathlib.Path(args.rom).expanduser().resolve()
     output = pathlib.Path(args.output).expanduser().resolve()
-    if not rom_path.is_file():
-        raise ValueError(f"ROM not found: {rom_path}")
-    if rom_path.suffix.lower() not in (".sfc", ".smc"):
-        raise ValueError("ROM must be an .sfc or .smc file")
+    try:
+        identity = verify_rom(rom_path)
+    except RomVerifyError as exc:
+        raise ValueError(str(exc)) from exc
     raw = rom_path.read_bytes()
-    if len(raw) < 32 * 1024 or len(raw) > 16 * 1024 * 1024:
-        raise ValueError("ROM size is outside the supported 32 KiB to 16 MiB range")
-    if len(raw) % 1024 not in (0, 512):
-        raise ValueError("ROM size is not a standard SNES image size")
     if output.exists():
         if not output.is_dir():
             raise ValueError(f"output path is not a directory: {output}")
@@ -146,7 +136,8 @@ cmake --build "$ROOT/build" --config Release --parallel
     write_text(output / "project.txt", (
         f"name={title}\n"
         f"rom_file={rom_path.name}\n"
-        f"rom_sha256={hashlib.sha256(raw).hexdigest()}\n"
+        f"rom_sha256={identity['sha256']}\n"
+        f"rom_crc32={identity['crc32']}\n"
         f"normalized_size={len(normalized_rom)}\n"
         f"mapping={mapping}\n"
     ))
@@ -184,27 +175,48 @@ unless you have permission.
     return 0
 
 
+def build_command(args: argparse.Namespace) -> int:
+    return build_project(args)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="snesrecomp",
-        description="Turn a SNES ROM into a recompilation source project.")
+        description=(
+            "Turn a SNES ROM into recompilation sources, or regenerate an "
+            "existing project for UI / launcher automation."
+        ),
+    )
     commands = result.add_subparsers(dest="command", required=True)
+
     build = commands.add_parser(
-        "build", help="generate C source and build scripts from a ROM")
+        "build", help="scaffold a new project and generate C from a ROM")
     build.add_argument("--rom", required=True, help="path to a .sfc or .smc ROM")
     build.add_argument("--output", "-o", required=True, help="new output directory")
     build.add_argument("--name", help="project title (defaults to the ROM filename)")
-    build.set_defaults(handler=build_project)
+    build.set_defaults(handler=build_command)
+
+    add_generate_parser(commands)
+    add_verify_parser(commands)
     return result
 
 
 def main() -> int:
     arguments = parser().parse_args()
+    handler = arguments.handler
+
+    # SDK commands own their ProgressReporter / exit codes.
+    if arguments.command in ("generate", "verify-rom"):
+        progress = ProgressReporter(
+            json_progress=bool(getattr(arguments, "json_progress", False)),
+        )
+        return handler(arguments, progress)
+
     try:
-        return arguments.handler(arguments)
+        return handler(arguments)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"snesrecomp: error: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":
