@@ -31,6 +31,7 @@ typedef struct Texture {
   const uint32_t *pixels;
   int width, height, stride;
   float shade;
+  int alpha_transparent;
 } Texture;
 
 typedef struct RenderContext {
@@ -168,7 +169,7 @@ static void draw_triangle(const RenderContext *ctx,
       if (texture_x >= texture->width) texture_x = texture->width - 1;
       if (texture_y >= texture->height) texture_y = texture->height - 1;
       color = texture->pixels[texture_y * texture->stride + texture_x];
-      if (!(color >> 24))
+      if (texture->alpha_transparent && !(color >> 24))
         continue;
       frame_pos = y * scene->framebuffer_stride + x;
       scene->framebuffer[frame_pos] = shade_color(color, texture->shade);
@@ -209,6 +210,7 @@ static Texture cell_texture(const RenderContext *ctx, int x, int y,
   texture.height = scene->cell_size;
   texture.stride = scene->output_width;
   texture.shade = shade;
+  texture.alpha_transparent = 0;
   return texture;
 }
 
@@ -275,6 +277,7 @@ static void render_billboards(const RenderContext *ctx) {
     texture.height = billboard->texture_height;
     texture.stride = billboard->pixel_stride;
     texture.shade = 1.0f;
+    texture.alpha_transparent = 1;
     draw_quad(ctx,
               vec3(left.x, left.y + billboard->world_height, left.z),
               vec3(right.x, right.y + billboard->world_height, right.z),
