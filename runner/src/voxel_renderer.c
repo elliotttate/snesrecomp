@@ -168,6 +168,8 @@ static void draw_triangle(const RenderContext *ctx,
       if (texture_x >= texture->width) texture_x = texture->width - 1;
       if (texture_y >= texture->height) texture_y = texture->height - 1;
       color = texture->pixels[texture_y * texture->stride + texture_x];
+      if (!(color >> 24))
+        continue;
       frame_pos = y * scene->framebuffer_stride + x;
       scene->framebuffer[frame_pos] = shade_color(color, texture->shade);
       s_depth[depth_pos] = inv_depth;
@@ -241,6 +243,42 @@ static void render_terrain(const RenderContext *ctx) {
         draw_quad(ctx, vec3(x1, height, z1), vec3(x1, height, z0),
                   vec3(x1, east, z0), vec3(x1, east, z1), &side_light);
     }
+  }
+}
+
+static void render_billboards(const RenderContext *ctx) {
+  const SnesVoxelScene *scene = ctx->scene;
+  for (int i = 0; i < scene->billboard_count; i++) {
+    const SnesVoxelBillboard *billboard = &scene->billboards[i];
+    Texture texture;
+    Vec3 horizontal_right;
+    Vec3 center, left, right;
+    if (!billboard->pixels || billboard->pixel_stride <= 0 ||
+        billboard->texture_width <= 0 || billboard->texture_height <= 0 ||
+        billboard->world_width <= 0.0f || billboard->world_height <= 0.0f)
+      continue;
+
+    horizontal_right = vec3_normalize(
+        vec3(ctx->right.x, 0.0f, ctx->right.z));
+    if (vec3_dot(horizontal_right, horizontal_right) < 0.5f)
+      horizontal_right = vec3(1.0f, 0.0f, 0.0f);
+    center = vec3(billboard->world_x, billboard->base_height,
+                  billboard->world_z);
+    left = vec3_sub(center,
+                    vec3_scale(horizontal_right,
+                               billboard->world_width * 0.5f));
+    right = vec3_sub(center,
+                     vec3_scale(horizontal_right,
+                                -billboard->world_width * 0.5f));
+    texture.pixels = billboard->pixels;
+    texture.width = billboard->texture_width;
+    texture.height = billboard->texture_height;
+    texture.stride = billboard->pixel_stride;
+    texture.shade = 1.0f;
+    draw_quad(ctx,
+              vec3(left.x, left.y + billboard->world_height, left.z),
+              vec3(right.x, right.y + billboard->world_height, right.z),
+              right, left, &texture);
   }
 }
 
@@ -359,6 +397,8 @@ int snes_voxel_render(const SnesVoxelScene *scene) {
                       : 0.59f);
 
   render_terrain(&ctx);
+  if (scene->billboards && scene->billboard_count > 0)
+    render_billboards(&ctx);
 
   if (scene->preserve_top_rows > 0) {
     int rows_to_copy = scene->preserve_top_rows;

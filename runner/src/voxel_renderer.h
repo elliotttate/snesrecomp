@@ -18,6 +18,18 @@ typedef float (*SnesVoxelHeightFn)(const uint32_t *cell_pixels,
                                    int cell_y,
                                    void *user);
 
+typedef struct SnesVoxelBillboard {
+  const uint32_t *pixels;
+  int pixel_stride;
+  int texture_width;
+  int texture_height;
+  float world_x;
+  float world_z;
+  float base_height;
+  float world_width;
+  float world_height;
+} SnesVoxelBillboard;
+
 typedef struct SnesVoxelScene {
   uint32_t *framebuffer;
   int framebuffer_stride;
@@ -32,6 +44,10 @@ typedef struct SnesVoxelScene {
   int cell_size;
   SnesVoxelHeightFn cell_height;
   void *user;
+
+  /* Optional upright, camera-facing sprites composited after terrain. */
+  const SnesVoxelBillboard *billboards;
+  int billboard_count;
 
   /* Orbit camera.  Positive elevation looks down at the scene. */
   float elevation_degrees;
