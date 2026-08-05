@@ -496,6 +496,23 @@ typedef struct RamRoutineGuard {
     uint32 hash;
 } RamRoutineGuard;
 
+/* Defined by the generated dispatch_v2.c — ALWAYS, for every game.
+ * program_emit.py emits this table unconditionally, using a single
+ * { 0xFFFFFFFFu, 0u, 0u } sentinel row when the cfg declares no `ram_routine`,
+ * so there is nothing here for the engine to fall back to.
+ *
+ * Deliberately plain, strong externs: do NOT reintroduce a weak definition or
+ * a weak declaration. Both are broken on PE/COFF, in opposite directions:
+ *   - a weak DEFINITION of an empty table in the engine WINS over the
+ *     generated strong one under mingw's linker, silently disabling every
+ *     RAM-routine guard on Windows while ELF kept working — a platform-only
+ *     performance cliff with no link error and no wrong output;
+ *   - a weak DECLARATION here degrades the generated definition into a COFF
+ *     weak external aliased to an unrelated symbol, so nothing defines it and
+ *     the link fails outright.
+ * A generated tree too old to emit this table is a stale-gen bug and MUST fail
+ * loudly at link time (the standing engine<->gen contract: regen all games or
+ * the link breaks), never degrade quietly at runtime. */
 extern const RamRoutineGuard g_ram_routine_guards[];
 extern const unsigned        g_ram_routine_guard_count;
 
