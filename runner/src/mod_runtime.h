@@ -56,6 +56,8 @@ void snes_mod_runtime_activate_plugins_c(void);
 const struct RecompLauncherCModProvider*
 snes_mod_runtime_launcher_provider_c(void);
 const char* snes_mod_runtime_last_error_c(void);
+const char* snes_mod_runtime_committed_option_value_c(
+    const char* package_id, const char* feature_id, const char* option_id);
 
 /*
  * Register a trusted implementation. A .snesmod archive may select only this

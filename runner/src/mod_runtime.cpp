@@ -2030,6 +2030,21 @@ void mod_runtime_activate_plugins() {
         if (plugin.callback) plugin.callback();
 }
 
+const char* mod_runtime_committed_option_value(const std::string& package_id,
+                                               const std::string& feature_id,
+                                               const std::string& option_id) {
+    Runtime& runtime = state();
+    if (!runtime.initialized) return nullptr;
+    const Package* package = selected_package(runtime, package_id);
+    if (!package) return nullptr;
+    const Feature* feature = find_feature(*package, feature_id);
+    const Option* option = find_option(*package, feature_id, option_id);
+    if (!feature || !option) return nullptr;
+    static std::string value;
+    value = option_value(runtime, *package, *feature, *option);
+    return value.c_str();
+}
+
 #if defined(RECOMP_LAUNCHER)
 const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
     return &provider;
@@ -2113,6 +2128,13 @@ extern "C" void snes_mod_runtime_activate_plugins_c(void) {
 
 extern "C" const char* snes_mod_runtime_last_error_c(void) {
     return SNESRecomp::state().error.c_str();
+}
+
+extern "C" const char* snes_mod_runtime_committed_option_value_c(
+    const char* package_id, const char* feature_id, const char* option_id) {
+    if (!package_id || !feature_id || !option_id) return nullptr;
+    return SNESRecomp::mod_runtime_committed_option_value(
+        package_id, feature_id, option_id);
 }
 
 extern "C" const RecompLauncherCModProvider*

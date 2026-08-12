@@ -38,9 +38,21 @@ extern Snes *g_snes;
 
 CpuState g_cpu;
 static CpuStageWindowStoreHook g_stage_window_store_hook;
+static CpuWramWrite8FilterHook g_wram_write8_filter_hook;
 
 void cpu_set_stage_window_store_hook(CpuStageWindowStoreHook hook) {
     g_stage_window_store_hook = hook;
+}
+
+void cpu_set_wram_write8_filter_hook(CpuWramWrite8FilterHook hook) {
+    g_wram_write8_filter_hook = hook;
+}
+
+uint8 cpu_filter_wram_write8(uint32_t ram_off, uint8 old_value,
+                             uint8 new_value) {
+    return g_wram_write8_filter_hook
+        ? g_wram_write8_filter_hook(ram_off, old_value, new_value)
+        : new_value;
 }
 
 /* ── Scoped write-log ring (dev, env-gated) ────────────────────────────────
@@ -443,6 +455,7 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     int off = cpu_wram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
+        v = cpu_filter_wram_write8((uint32_t)off, old, v);
         cpu->ram[off] = v;
         /* Optional title hook for game-specific stage-window tracking. */
         if (off >= 0x1E72 && off <= 0x1E79) {

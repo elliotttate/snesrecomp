@@ -31,8 +31,13 @@ extern "C" {
 /* Optional game hook for title-specific WRAM window tracking. The interpreter
  * updates g_interp816_cur_pc before each opcode; AOT writes leave it at zero. */
 typedef void (*CpuStageWindowStoreHook)(uint32_t ram_off, uint32_t pc24);
+typedef uint8 (*CpuWramWrite8FilterHook)(uint32_t ram_off, uint8 old_value,
+                                         uint8 new_value);
 extern uint32_t g_interp816_cur_pc;
 void cpu_set_stage_window_store_hook(CpuStageWindowStoreHook hook);
+void cpu_set_wram_write8_filter_hook(CpuWramWrite8FilterHook hook);
+uint8 cpu_filter_wram_write8(uint32_t ram_off, uint8 old_value,
+                             uint8 new_value);
 
 /* Canonical flat g_ram offset for full WRAM and its low-bank mirrors.
  * Returns -1 when the address is not WRAM. Keep every runtime observer on

@@ -73,6 +73,8 @@ extern uint64_t g_fp_max_frame;
 #define GET_BYTE(p) (*(uint8*)(p))
 
 extern int snes_frame_counter;
+uint8 cpu_filter_wram_write8(uint32_t ram_off, uint8 old_value,
+                             uint8 new_value);
 
 #include "spc_player.h"
 
@@ -189,21 +191,21 @@ static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
 }
 static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
-#if SNESRECOMP_REVERSE_DEBUG
   // Only fire the WRAM hook if the write actually landed in WRAM.
   // dst may point into ROM for in-ROM data-table writes (a NOP in practice
   // since ROM is read-only, but the ptr math still lands there).
   // Read old BEFORE the store so the Tier-1 log can emit old/new.
   if (dst >= g_ram && dst < g_ram + 0x20000) {
+    uint32_t ram_off = (uint32_t)(dst - g_ram);
     uint8_t old_val = dst[0];
+    value = cpu_filter_wram_write8(ram_off, old_val, value);
     dst[0] = value;
+#if SNESRECOMP_REVERSE_DEBUG
     debug_on_wram_write_byte((uint32_t)(dst - g_ram), old_val, value);
+#endif
   } else {
     dst[0] = value;
   }
-#else
-  dst[0] = value;
-#endif
 }
 
 // 16-bit word store through a 24-bit DP pointer. Native counterpart of
