@@ -212,6 +212,12 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom) {
   ppu->extraBottomCur = (uint8_t)IntMin(IntMax(bottom, 0), 16);
 }
 
+void PpuSetWidescreenPresentationXBias(Ppu *ppu, int bias) {
+  ppu->wsPresentationXBias =
+      (int16_t)IntMin(IntMax(bias, -kPpuExtraLeftRight),
+                     kPpuExtraLeftRight);
+}
+
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start) {
   // See ppu.h. Chunk bounds must be ordered for the span construction in
@@ -1975,7 +1981,7 @@ static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
     else if (x >= ppu->wsHudRightStart && x < 256)
       x += right_extra;
   }
-  return x;
+  return x - ppu->wsPresentationXBias;
 }
 
 static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {

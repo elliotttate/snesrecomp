@@ -263,6 +263,10 @@ struct Ppu {
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
 
+  /* Host-only presentation-camera correction. It shifts decoded OBJ X but
+   * is outside the serialized PPU snapshot and never affects game logic. */
+  int16_t wsPresentationXBias;
+
   // Host-only widescreen state; excluded from savestates and cleared by reset.
   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
   void *widescreenLineEnhancerContext;
@@ -455,6 +459,10 @@ void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget);
 // scroll/room-bounds state drives the visible margin dynamically (Zelda),
 // versus PpuSetExtraSpace's fixed symmetric border (SMW).
 void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
+
+// Shift OBJ presentation left by `bias` pixels. A game using this must apply
+// the same bias to rendered background hScroll values for alignment.
+void PpuSetWidescreenPresentationXBias(Ppu *ppu, int bias);
 
 // Widescreen HUD split (opt-in, configured by the game frontend): for
 // scanlines < height, BG3 (layer 2) is drawn as three chunks — source
