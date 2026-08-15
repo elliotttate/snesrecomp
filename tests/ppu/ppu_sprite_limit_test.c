@@ -17,6 +17,17 @@ uint16_t WsShadowTile(int layer, int screen_x, uint32_t wrapped_y,
     return real_tile;
 }
 
+uint16_t WsShadowTileDebug(int layer, int screen_x, int screen_y,
+                           int pixel_span, uint32_t wrapped_y,
+                           uint16_t h_scroll, uint16_t map_word_adr,
+                           uint16_t real_tile) {
+    (void)screen_y;
+    (void)pixel_span;
+    (void)h_scroll;
+    (void)map_word_adr;
+    return WsShadowTile(layer, screen_x, wrapped_y, real_tile);
+}
+
 bool WsShadowLayerActive(int layer) {
     (void)layer;
     return false;

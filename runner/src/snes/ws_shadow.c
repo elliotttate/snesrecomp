@@ -37,6 +37,9 @@ typedef struct WsShadowLayer {
    * (e.g. MMX room decompression racing the first widescreen frame);
    * captured entries are authoritative and never yield to a guess. */
   uint8_t *guessOrigin;
+  /* Exact decoder fill written through WsShadowForceTile. Authoritative for
+   * ownership, but distinct from a live VRAM capture in debug provenance. */
+  uint8_t *forceOrigin;
   uint32_t validCount;
   int blankTilePlus1;
   uint32_t lastTx0;
@@ -81,6 +84,52 @@ static WsShadowLayer s_layers[kLayers];
 /* Always-on margin lookup accounting (see WsShadowTile). Never armed. */
 static WsShadowMarginStat s_marginStats[kLayers];
 
+/* Optional host-only provenance surface. Logical screen X is biased by the
+ * PPU's compile-time margin capacity. This is deliberately outside Ppu and
+ * WsShadowLayer so reset/saveload cannot make it guest-visible. */
+enum { kWsDebugProvenanceLines = 240 };
+static bool s_debugProvenanceEnabled;
+static uint8_t
+    s_debugProvenance[kLayers][kWsDebugProvenanceLines][kPpuBufWidth];
+
+void WsShadowDebugSetProvenanceEnabled(bool enabled) {
+  s_debugProvenanceEnabled = enabled;
+  if (!enabled)
+    memset(s_debugProvenance, 0, sizeof s_debugProvenance);
+}
+
+bool WsShadowDebugProvenanceEnabled(void) {
+  return s_debugProvenanceEnabled;
+}
+
+void WsShadowDebugBeginFrame(void) {
+  if (s_debugProvenanceEnabled)
+    memset(s_debugProvenance, 0, sizeof s_debugProvenance);
+}
+
+uint8_t WsShadowDebugProvenanceAt(int layer, int screenX, int screenY) {
+  const int x = screenX + kPpuExtraLeftRight;
+  if (!s_debugProvenanceEnabled || layer < 0 || layer >= kLayers ||
+      screenY < 0 || screenY >= kWsDebugProvenanceLines ||
+      x < 0 || x >= kPpuBufWidth)
+    return kWsShadowProvenanceNone;
+  return s_debugProvenance[layer][screenY][x];
+}
+
+static void RecordDebugProvenance(int layer, int screenX, int screenY,
+                                  int pixelSpan, uint8_t source) {
+  if (!s_debugProvenanceEnabled || source == kWsShadowProvenanceNone ||
+      layer < 0 || layer >= kLayers || screenY < 0 ||
+      screenY >= kWsDebugProvenanceLines || pixelSpan <= 0)
+    return;
+  int x0 = screenX + kPpuExtraLeftRight;
+  int x1 = x0 + pixelSpan;
+  if (x0 < 0) x0 = 0;
+  if (x1 > kPpuBufWidth) x1 = kPpuBufWidth;
+  for (int x = x0; x < x1; x++)
+    s_debugProvenance[layer][screenY][x] = source;
+}
+
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry);
 
@@ -117,6 +166,8 @@ static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
    * any future prefill guess for this cell. */
   if (layer->guessOrigin)
     layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
+  if (layer->forceOrigin)
+    layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
 static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
@@ -128,6 +179,17 @@ static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
   layer->valid[i >> 3] |= (uint8_t)(1u << (i & 7));
   if (layer->guessOrigin)
     layer->guessOrigin[i >> 3] |= (uint8_t)(1u << (i & 7));
+  if (layer->forceOrigin)
+    layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
+}
+
+static void SetEntryForced(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
+                           uint16_t entry) {
+  SetEntry(layer, tx, ty, entry);
+  if (!layer->forceOrigin || !InBounds(tx, ty))
+    return;
+  uint32_t i = ty * kWsShadowXTiles + tx;
+  layer->forceOrigin[i >> 3] |= (uint8_t)(1u << (i & 7));
 }
 
 static bool IsGuessOrigin(const WsShadowLayer *layer, uint32_t tx,
@@ -136,6 +198,14 @@ static bool IsGuessOrigin(const WsShadowLayer *layer, uint32_t tx,
     return false;
   uint32_t i = ty * kWsShadowXTiles + tx;
   return (layer->guessOrigin[i >> 3] & (1u << (i & 7))) != 0;
+}
+
+static bool IsForceOrigin(const WsShadowLayer *layer, uint32_t tx,
+                          uint32_t ty) {
+  if (!layer->forceOrigin || !InBounds(tx, ty))
+    return false;
+  uint32_t i = ty * kWsShadowXTiles + tx;
+  return (layer->forceOrigin[i >> 3] & (1u << (i & 7))) != 0;
 }
 
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
@@ -154,6 +224,10 @@ static void ClearEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
     return;
   uint32_t i = ty * kWsShadowXTiles + tx;
   layer->valid[i >> 3] &= (uint8_t)~(1u << (i & 7));
+  if (layer->guessOrigin)
+    layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
+  if (layer->forceOrigin)
+    layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
 static bool IsLiveOpaque(uint16_t tile) {
@@ -167,6 +241,8 @@ void WsShadowReset(void) {
       memset(layer->valid, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
     if (layer->guessOrigin)
       memset(layer->guessOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
+    if (layer->forceOrigin)
+      memset(layer->forceOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
     if (layer->cooldown)
       memset(layer->cooldown, 0, (size_t)kWsShadowXTiles * kWsShadowYTiles);
     layer->validCount = 0;
@@ -203,12 +279,14 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
     layer->entries = (uint16_t *)calloc(count, sizeof(uint16_t));
     layer->valid = (uint8_t *)calloc(count / 8, 1);
     layer->guessOrigin = (uint8_t *)calloc(count / 8, 1);
+    layer->forceOrigin = (uint8_t *)calloc(count / 8, 1);
     layer->cooldown = (uint8_t *)calloc(count, 1);
     if (!layer->entries || !layer->valid || !layer->guessOrigin ||
-        !layer->cooldown) {
+        !layer->forceOrigin || !layer->cooldown) {
       free(layer->entries);
       free(layer->valid);
       free(layer->guessOrigin);
+      free(layer->forceOrigin);
       free(layer->cooldown);
       memset(layer, 0, sizeof(*layer));
       return;
@@ -410,7 +488,7 @@ void WsShadowForceTile(int layerIndex, uint32_t worldTileX,
         return;
     }
   }
-  SetEntry(layer, worldTileX, worldTileY, entry);
+  SetEntryForced(layer, worldTileX, worldTileY, entry);
 }
 
 void WsShadowForceWestViewportTile(int layerIndex, uint32_t worldTileX,
@@ -985,6 +1063,8 @@ void WsShadowFrame(const struct Ppu *ppu) {
           memset(layer->valid, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
         if (layer->guessOrigin)
           memset(layer->guessOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
+        if (layer->forceOrigin)
+          memset(layer->forceOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
         if (layer->cooldown)
           memset(layer->cooldown, 0,
                  (size_t)kWsShadowXTiles * kWsShadowYTiles);
@@ -1271,9 +1351,10 @@ static uint8_t FoldRowPeriod(WsShadowLayer *layer, int row, int natCol) {
   return period;
 }
 
-uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
-                      uint16_t hScroll, uint16_t mapWordAdr,
-                      uint16_t realTile) {
+uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
+                           int pixelSpan, uint32_t wrappedY,
+                           uint16_t hScroll, uint16_t mapWordAdr,
+                           uint16_t realTile) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return realTile;
   WsShadowLayer *layer = &s_layers[layerIndex];
@@ -1321,8 +1402,17 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
     } else {
       if (hit) st->eastHit++; else st->eastMiss++;
     }
-    if (hit)
+    if (hit) {
+      const uint32_t tx = (uint32_t)worldX >> shift;
+      const uint32_t ty = (uint32_t)worldY >> shift;
+      const bool generated = IsGuessOrigin(layer, tx, ty) ||
+                             IsForceOrigin(layer, tx, ty);
+      RecordDebugProvenance(
+          layerIndex, screenX, screenY, pixelSpan,
+          generated ? kWsShadowProvenancePrefill
+                    : kWsShadowProvenanceCaptured);
       return entry;
+    }
   }
 
   if (layer->fold && layer->foldVram) {
@@ -1339,6 +1429,8 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
             s_marginStats[layerIndex].westFold++;
           else
             s_marginStats[layerIndex].eastFold++;
+          RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
+                                kWsShadowProvenanceFold);
           return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
         }
         return realTile;  /* native column (or margin overlapping it) */
@@ -1351,13 +1443,24 @@ uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
       s_marginStats[layerIndex].westBlank++;
     else
       s_marginStats[layerIndex].eastBlank++;
+    RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
+                          kWsShadowProvenanceBlank);
     return (uint16_t)(layer->blankTilePlus1 - 1);
   }
   if (screenX < 0)
     s_marginStats[layerIndex].westRawFallback++;
   else
     s_marginStats[layerIndex].eastRawFallback++;
+  RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
+                        kWsShadowProvenanceRawFallback);
   return realTile;
+}
+
+uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
+                      uint16_t hScroll, uint16_t mapWordAdr,
+                      uint16_t realTile) {
+  return WsShadowTileDebug(layerIndex, screenX, -1, 0, wrappedY, hScroll,
+                           mapWordAdr, realTile);
 }
 
 bool WsShadowLayerActive(int layerIndex) {

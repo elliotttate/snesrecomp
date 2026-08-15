@@ -84,6 +84,22 @@ typedef struct WsShadowMarginStat {
 } WsShadowMarginStat;
 void WsShadowGetMarginStats(int layer, WsShadowMarginStat *out);
 
+/* Host-only margin provenance capture. Disabled by default and never part of
+ * emulated or serialized state. When armed, the PPU's background renderers
+ * record the exact source selected for each widened-margin pixel. */
+typedef enum WsShadowProvenance {
+  kWsShadowProvenanceNone = 0,
+  kWsShadowProvenanceCaptured,
+  kWsShadowProvenancePrefill,
+  kWsShadowProvenanceFold,
+  kWsShadowProvenanceBlank,
+  kWsShadowProvenanceRawFallback,
+} WsShadowProvenance;
+void WsShadowDebugSetProvenanceEnabled(bool enabled);
+bool WsShadowDebugProvenanceEnabled(void);
+void WsShadowDebugBeginFrame(void);
+uint8_t WsShadowDebugProvenanceAt(int layer, int screenX, int screenY);
+
 /* Read-only diagnostic lookup in the world-keyed store. This does not alter
  * hit/miss counters or renderer state. It lets offline route audits compare
  * the exact tilemap entry served in a margin with the entry later captured
@@ -177,6 +193,9 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value);
 uint16_t WsShadowTile(int layer, int screenX, uint32_t wrappedY,
                       uint16_t hScroll, uint16_t mapWordAdr,
                       uint16_t realTile);
+uint16_t WsShadowTileDebug(int layer, int screenX, int screenY, int pixelSpan,
+                           uint32_t wrappedY, uint16_t hScroll,
+                           uint16_t mapWordAdr, uint16_t realTile);
 bool WsShadowLayerActive(int layer);
 
 /* Latched world/scroll origins for margin pixel-phase (must match tile keys). */
