@@ -37,10 +37,10 @@ extern "C" {
 #define SNESRECOMP_TRACE 0
 #endif
 
-/* Lean per-function-entry hook: compiles ONLY cpu_trace_func_entry (for
- * profiling and WRAM watchpoints) without the full trace machinery the
- * generated code otherwise pulls in (block/px/pb rings, debug server).
- * Implied by SNESRECOMP_TRACE. */
+/* Lean generated-function hook: compiles entry plus matched exit/host-boundary
+ * callbacks (for profiling and WRAM watchpoints) without the full trace
+ * machinery the generated code otherwise pulls in (block/px/pb rings, debug
+ * server). Implied by SNESRECOMP_TRACE. */
 #ifndef SNESRECOMP_FUNC_ENTRY_HOOK
 #define SNESRECOMP_FUNC_ENTRY_HOOK 0
 #endif
@@ -185,6 +185,10 @@ extern uint32_t      g_db_watch_bits[8];
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24);
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name);
+/* Matched generated-function exit and host-boundary hooks make lean WRAM
+ * watch attribution a real function window rather than "previous entry". */
+void cpu_trace_func_exit(CpuState *cpu);
+void cpu_trace_func_boundary_reset(CpuState *cpu);
 void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                      uint8_t extra0, uint16_t extra1);
 
@@ -1324,8 +1328,12 @@ void cpu_trace_dump_wram(const char *tag, int scan_n);
 static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24)            { (void)cpu; (void)pc24; }
 #if SNESRECOMP_FUNC_ENTRY_HOOK
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name);
+void cpu_trace_func_exit(CpuState *cpu);
+void cpu_trace_func_boundary_reset(CpuState *cpu);
 #else
 static inline void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) { (void)cpu; (void)pc24; (void)name; }
+static inline void cpu_trace_func_exit(CpuState *cpu) { (void)cpu; }
+static inline void cpu_trace_func_boundary_reset(CpuState *cpu) { (void)cpu; }
 #endif
 static inline void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t et,
                                    uint8_t e0, uint16_t e1)                 { (void)cpu; (void)pc24; (void)et; (void)e0; (void)e1; }

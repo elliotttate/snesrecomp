@@ -474,6 +474,11 @@ void RecompStackPop(void) {
   // the function name is still the topmost entry. Defensive against
   // empty stack: the auditor must NOT consume an entry_seq it didn't push.
   if (g_recomp_stack_top > 0) {
+    /* Generated code has one RecompStackPop on every exit path.  Observe the
+     * complete callee window before restoring its parent; otherwise writes in
+     * the parent's post-call tail are falsely assigned to the callee that was
+     * merely the previous function entry. */
+    cpu_trace_func_exit(&g_cpu);
     const char *fn = g_recomp_stack[g_recomp_stack_top - 1];
     int slot = g_recomp_stack_top - 1;
     int delta = (int)(int16_t)(g_cpu.S - g_cpu_entry_s[slot]) -
@@ -502,6 +507,9 @@ jmp_buf g_watchdog_jmp;
 int g_watchdog_tripped;
 
 void WatchdogFrameStart(void) {
+  /* Close any abandoned window after a watchdog unwind and classify changes
+   * made between guest calls as host/outside-function-window. */
+  cpu_trace_func_boundary_reset(&g_cpu);
   g_frame_start_clock = clock();
   g_watchdog_enabled = 1;
   g_watchdog_tripped = 0;

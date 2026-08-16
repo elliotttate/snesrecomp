@@ -3,6 +3,7 @@
 #include "cpu_trace.h"
 
 #if SNESRECOMP_TRACE || SNESRECOMP_FUNC_ENTRY_HOOK
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,9 +11,10 @@
 /* ---- function-entry profiling + WRAM watchpoints (trace/hook builds) ------
  *
  * Both are env-gated and zero-cost when unset. They piggyback on the
- * per-function-entry hook, so granularity is the traced function window:
- * a watched change is attributed to the function whose body (including
- * untraced leaf work) executed since the previous entry.
+ * generated function-boundary hooks.  Entry and exit observations bracket
+ * every AOT window, so parent work after a child returns is not assigned to
+ * that child.  A change first observed while no generated function is active
+ * is explicitly unattributed (interpreter/host/outside-function-window).
  *
  *   SNESRECOMP_FUNC_PROFILE=<path>    per-function call counts + frame
  *       span + up to 4 distinct context values, dumped as jsonl at exit.
@@ -22,7 +24,13 @@
  *       (total capped at 4 KiB).
  *   SNESRECOMP_WATCH_LOG=<path>       watch events jsonl (default stderr).
  */
-enum { kProfSlots = 16384, kWatchMaxBytes = 4096, kWatchMaxRanges = 16 };
+enum {
+    kProfSlots = 16384,
+    kWatchMaxBytes = 4096,
+    kWatchMaxRanges = 16,
+    kWatchOwnerDepth = 256,
+    kWatchLinesPerFrame = 256
+};
 
 typedef struct ProfEntry {
     uint32_t pc24;            /* 0 = empty */
@@ -46,8 +54,10 @@ static int g_watch_range_count;
 static uint8_t g_watch_shadow[kWatchMaxBytes];
 static int g_watch_shadow_valid;
 static FILE *g_watch_out;
-static uint32_t g_watch_prev_pc;
-static const char *g_watch_prev_name;
+static uint32_t g_watch_owner_pc[kWatchOwnerDepth];
+static const char *g_watch_owner_name[kWatchOwnerDepth];
+static int g_watch_owner_depth;
+static int g_watch_owner_overflow;
 static int g_watch_lines_this_frame;
 static int g_watch_frame_seen = -1;
 
@@ -69,6 +79,52 @@ static void prof_dump_at_exit(void) {
     g_prof_out = NULL;
 }
 
+static int watch_parse_spec(const char *spec) {
+    WatchRange parsed[kWatchMaxRanges];
+    int count = 0;
+    uint32_t total = 0;
+    const char *cursor = spec;
+    while (cursor && *cursor) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        if (!*cursor || count >= kWatchMaxRanges) return 0;
+        char *end = NULL;
+        unsigned long raw_addr = strtoul(cursor, &end, 16);
+        if (end == cursor || raw_addr > 0x1FFFFul) return 0;
+        cursor = end;
+        unsigned long raw_len = 2;
+        if (*cursor == ':') {
+            const char *len_start = ++cursor;
+            raw_len = strtoul(cursor, &end, 16);
+            if (end == len_start) return 0;
+            cursor = end;
+        }
+        if (raw_len == 0 || raw_len > kWatchMaxBytes ||
+            raw_addr + raw_len > 0x20000ul ||
+            total + (uint32_t)raw_len > kWatchMaxBytes)
+            return 0;
+        for (int i = 0; i < count; i++) {
+            uint32_t prior_end = parsed[i].addr + parsed[i].len;
+            uint32_t this_end = (uint32_t)(raw_addr + raw_len);
+            if ((uint32_t)raw_addr < prior_end && parsed[i].addr < this_end)
+                return 0;
+        }
+        parsed[count].addr = (uint32_t)raw_addr;
+        parsed[count].len = (uint32_t)raw_len;
+        count++;
+        total += (uint32_t)raw_len;
+        while (isspace((unsigned char)*cursor)) cursor++;
+        if (!*cursor) break;
+        if (*cursor != ',') return 0;
+        cursor++;
+        while (isspace((unsigned char)*cursor)) cursor++;
+        if (!*cursor) return 0;
+    }
+    if (!count) return 0;
+    memcpy(g_watch_ranges, parsed, (size_t)count * sizeof parsed[0]);
+    g_watch_range_count = count;
+    return 1;
+}
+
 static void prof_watch_init_once(void) {
     static int initialized = 0;
     if (initialized) return;
@@ -86,27 +142,82 @@ static void prof_watch_init_once(void) {
     }
     const char *watch_spec = getenv("SNESRECOMP_WATCH");
     if (watch_spec && watch_spec[0]) {
-        uint32_t total = 0;
-        const char *cursor = watch_spec;
-        while (*cursor && g_watch_range_count < kWatchMaxRanges) {
-            char *end = NULL;
-            uint32_t addr = (uint32_t)strtoul(cursor, &end, 16) & 0x1FFFF;
-            uint32_t len = 2;
-            if (end && *end == ':')
-                len = (uint32_t)strtoul(end + 1, &end, 16);
-            if (len == 0) len = 1;
-            if (total + len > kWatchMaxBytes) break;
-            g_watch_ranges[g_watch_range_count].addr = addr;
-            g_watch_ranges[g_watch_range_count].len = len;
-            g_watch_range_count++;
-            total += len;
-            if (!end || *end != ',') break;
-            cursor = end + 1;
+        if (!watch_parse_spec(watch_spec)) {
+            fprintf(stderr,
+                    "[func-watch] invalid SNESRECOMP_WATCH='%s'; disabled\n",
+                    watch_spec);
+        } else {
+            const char *log_path = getenv("SNESRECOMP_WATCH_LOG");
+            g_watch_out = (log_path && log_path[0]) ? fopen(log_path, "wb")
+                                                    : stderr;
+            if (!g_watch_out) {
+                fprintf(stderr,
+                        "[func-watch] cannot open SNESRECOMP_WATCH_LOG; disabled\n");
+                g_watch_range_count = 0;
+            }
         }
-        const char *log_path = getenv("SNESRECOMP_WATCH_LOG");
-        g_watch_out = (log_path && log_path[0]) ? fopen(log_path, "wb")
-                                                : stderr;
     }
+}
+
+static void watch_observe_boundary(const char *boundary) {
+    extern uint8_t g_ram[0x20000];
+    extern int snes_frame_counter;
+    if (!g_watch_range_count) return;
+    if (g_watch_frame_seen != snes_frame_counter) {
+        g_watch_frame_seen = snes_frame_counter;
+        g_watch_lines_this_frame = 0;
+    }
+    const int attributed = !g_watch_owner_overflow && g_watch_owner_depth > 0;
+    const uint32_t writer_pc = attributed
+        ? g_watch_owner_pc[g_watch_owner_depth - 1] : 0;
+    const char *writer = g_watch_owner_overflow
+        ? "function-depth-overflow"
+        : attributed ? g_watch_owner_name[g_watch_owner_depth - 1]
+                     : "host/outside-function-window";
+    uint32_t offset = 0;
+    for (int r = 0; r < g_watch_range_count; r++) {
+        const WatchRange *range = &g_watch_ranges[r];
+        if (g_watch_shadow_valid &&
+            memcmp(g_watch_shadow + offset, g_ram + range->addr,
+                   range->len) != 0) {
+            for (uint32_t i = 0; i < range->len; i++) {
+                uint8_t old_value = g_watch_shadow[offset + i];
+                uint8_t new_value = g_ram[range->addr + i];
+                if (old_value == new_value) continue;
+                if (g_watch_out &&
+                    g_watch_lines_this_frame < kWatchLinesPerFrame) {
+                    fprintf(g_watch_out,
+                            "{\"type\":\"watch_change\",\"frame\":%d,"
+                            "\"addr\":\"0x%05X\",\"old\":\"0x%02X\","
+                            "\"new\":\"0x%02X\",\"attributed\":%s,"
+                            "\"attribution\":\"%s\",\"writer_pc\":",
+                            snes_frame_counter, range->addr + i,
+                            old_value, new_value,
+                            attributed ? "true" : "false",
+                            attributed ? "function-window-net-change"
+                                       : "outside-function-window");
+                    if (attributed)
+                        fprintf(g_watch_out, "\"0x%06X\"", writer_pc);
+                    else
+                        fputs("null", g_watch_out);
+                    fprintf(g_watch_out,
+                            ",\"writer\":\"%s\",\"boundary\":\"%s\"}\n",
+                            writer ? writer : "?", boundary ? boundary : "?");
+                } else if (g_watch_out &&
+                           g_watch_lines_this_frame == kWatchLinesPerFrame) {
+                    fprintf(g_watch_out,
+                            "{\"type\":\"watch_truncated\",\"frame\":%d,"
+                            "\"limit\":%d}\n",
+                            snes_frame_counter, kWatchLinesPerFrame);
+                }
+                g_watch_lines_this_frame++;
+            }
+            if (g_watch_out) fflush(g_watch_out);
+        }
+        memcpy(g_watch_shadow + offset, g_ram + range->addr, range->len);
+        offset += range->len;
+    }
+    g_watch_shadow_valid = 1;
 }
 
 static void prof_watch_on_entry(CpuState *cpu, uint32_t pc24,
@@ -144,40 +255,41 @@ static void prof_watch_on_entry(CpuState *cpu, uint32_t pc24,
     }
 
     if (g_watch_range_count) {
-        if (g_watch_frame_seen != snes_frame_counter) {
-            g_watch_frame_seen = snes_frame_counter;
-            g_watch_lines_this_frame = 0;
+        watch_observe_boundary("entry");
+        if (g_watch_owner_overflow) {
+            g_watch_owner_overflow++;
+        } else if (g_watch_owner_depth < kWatchOwnerDepth) {
+            g_watch_owner_pc[g_watch_owner_depth] = pc24;
+            g_watch_owner_name[g_watch_owner_depth] = name;
+            g_watch_owner_depth++;
+        } else {
+            g_watch_owner_overflow = 1;
         }
-        uint32_t offset = 0;
-        for (int r = 0; r < g_watch_range_count; r++) {
-            const WatchRange *range = &g_watch_ranges[r];
-            if (g_watch_shadow_valid &&
-                memcmp(g_watch_shadow + offset, g_ram + range->addr,
-                       range->len) != 0) {
-                for (uint32_t i = 0; i < range->len; i++) {
-                    uint8_t old_value = g_watch_shadow[offset + i];
-                    uint8_t new_value = g_ram[range->addr + i];
-                    if (old_value == new_value) continue;
-                    if (g_watch_out &&
-                        g_watch_lines_this_frame++ < 256)
-                        fprintf(g_watch_out,
-                                "{\"frame\":%d,\"addr\":\"0x%05X\","
-                                "\"old\":\"0x%02X\",\"new\":\"0x%02X\","
-                                "\"writer_pc\":\"0x%06X\","
-                                "\"writer\":\"%s\"}\n",
-                                snes_frame_counter, range->addr + i,
-                                old_value, new_value, g_watch_prev_pc,
-                                g_watch_prev_name ? g_watch_prev_name : "?");
-                }
-                if (g_watch_out) fflush(g_watch_out);
-            }
-            memcpy(g_watch_shadow + offset, g_ram + range->addr, range->len);
-            offset += range->len;
-        }
-        g_watch_shadow_valid = 1;
-        g_watch_prev_pc = pc24;
-        g_watch_prev_name = name;
     }
+}
+
+void cpu_trace_func_exit(CpuState *cpu) {
+    (void)cpu;
+    prof_watch_init_once();
+    if (!g_watch_range_count) return;
+    watch_observe_boundary("exit");
+    if (g_watch_owner_overflow)
+        g_watch_owner_overflow--;
+    else if (g_watch_owner_depth > 0)
+        g_watch_owner_depth--;
+}
+
+void cpu_trace_func_boundary_reset(CpuState *cpu) {
+    (void)cpu;
+    prof_watch_init_once();
+    /* An owner still present here was abandoned by a non-local host unwind
+     * (for example the frame watchdog).  We can no longer separate guest work
+     * inside that window from work the host performed after the unwind, so
+     * fail closed: clear the owner before observing the boundary. */
+    g_watch_owner_depth = 0;
+    g_watch_owner_overflow = 0;
+    if (g_watch_range_count)
+        watch_observe_boundary("host-boundary");
 }
 
 #endif /* SNESRECOMP_TRACE || SNESRECOMP_FUNC_ENTRY_HOOK */
@@ -1488,8 +1600,8 @@ static uint32_t fnv1a(const char *s) {
 }
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
-    if (g_freeze_capture) return;  /* deliberate inspection-freeze */
     prof_watch_on_entry(cpu, pc24, name);
+    if (g_freeze_capture) return;  /* deliberate inspection-freeze */
     /* Investigation (env-gated): log DB/PB at every function entry inside a
      * frame window so a data-bank divergence can be located by chain.
      * SNESRECOMP_DBTRACE="lo-hi". Off by default, zero cost when unset. */

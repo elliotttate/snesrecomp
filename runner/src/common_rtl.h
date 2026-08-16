@@ -43,6 +43,25 @@ extern uint64_t g_apu_last_sync_cycles;
 // FastROM bit (g_memsel) is declared in cpu_state.h so generated blocks can see
 // it; it's defined alongside the pacing state in common_rtl.c.
 extern uint64_t g_apu_last_sync_master;
+
+/* Presentation-only speculative execution.  A game integration may run a
+ * checksum-locked guest routine against disposable WRAM (for example to
+ * animate an offscreen render proxy), but that routine must not publish
+ * clocks or touch host devices.  The mixed AOT/LLE bridge consults this scope
+ * before synchronizing the live SNES/APU clock, and direct MMIO helpers mark
+ * the scope rejected instead of mutating hardware.  Normal emulation never
+ * enters the scope and remains byte-for-byte on its existing path. */
+enum RtlSpeculativeViolation {
+  RTL_SPECULATIVE_VIOLATION_NONE = 0,
+  RTL_SPECULATIVE_VIOLATION_NESTED = 1,
+  RTL_SPECULATIVE_VIOLATION_MMIO_READ = 2,
+  RTL_SPECULATIVE_VIOLATION_MMIO_WRITE = 3,
+};
+void RtlSpeculativeExecutionBegin(void);
+void RtlSpeculativeExecutionEnd(void);
+bool RtlSpeculativeExecutionActive(void);
+uint32_t RtlSpeculativeExecutionViolation(void);
+void RtlSpeculativeExecutionReject(uint32_t violation);
 /* True while RtlRunFrame's absolute guest-frame clock owns SPC progression.
  * Interpreter fallback must not also add its legacy relative catch-up for the
  * same elapsed master cycles. */

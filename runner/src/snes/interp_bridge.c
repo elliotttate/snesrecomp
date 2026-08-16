@@ -63,6 +63,10 @@ static uint64_t bridge_bounce_flush_thresh(void) {
     return (uint64_t)s_t;
 }
 static void bridge_apu_flush(CpuState *cpu) {
+    /* A presentation-only guest transaction owns no emulated time.  Preserve
+     * any real pending bridge credit for the enclosing gameplay execution and
+     * do not move the global APU sync pointer to the disposable CPU clock. */
+    if (RtlSpeculativeExecutionActive()) return;
     if (!s_apu_pending_master) return;
     /* RtlRunFrame's absolute guest-cycle clock and this legacy relative
      * catch-up describe the same elapsed time. Running both made interpreted
@@ -1125,8 +1129,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
             cpu->coprocessor_master_cycles = cpu->master_cycles;
-            if (g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
-            if (g_snes && g_snes->cart)
+            if (g_snes && !RtlSpeculativeExecutionActive())
+                snes_sync_master_clock(g_snes, cpu->master_cycles);
+            if (g_snes && g_snes->cart &&
+                !RtlSpeculativeExecutionActive())
                 cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
 #ifdef SNES_COSIM
             /* Shared APU clock (common_rtl.h): the guest-time advance is a
@@ -1140,7 +1146,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             {
                 /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
                  * convert on APU-port access / ~4096 master / exits. */
-                if (!interp_bridge_use_absolute_apu_timeline(
+                if (!RtlSpeculativeExecutionActive() &&
+                    !interp_bridge_use_absolute_apu_timeline(
                         rtl_apu_frame_timeline_active(),
                         g_snes && cart_has_sa1(g_snes->cart))) {
                     s_apu_pending_master += _master;

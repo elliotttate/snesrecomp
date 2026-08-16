@@ -150,6 +150,40 @@ static uint64_t rtl_apu_guest_cycle(void) {
 // memsel-independent there), so this stays 0 and the emitted charge is constant.
 uint8_t g_memsel = 0;
 
+/* See common_rtl.h.  This is deliberately process-local host state, not part
+ * of a SNES save state.  Only the game thread enters it; the audio thread does
+ * not use the CPU MMIO/bridge paths guarded below. */
+static unsigned s_speculative_execution_depth;
+static uint32_t s_speculative_execution_violation;
+
+void RtlSpeculativeExecutionBegin(void) {
+  if (s_speculative_execution_depth++ == 0) {
+    s_speculative_execution_violation = RTL_SPECULATIVE_VIOLATION_NONE;
+  } else if (s_speculative_execution_violation ==
+             RTL_SPECULATIVE_VIOLATION_NONE) {
+    s_speculative_execution_violation = RTL_SPECULATIVE_VIOLATION_NESTED;
+  }
+}
+
+void RtlSpeculativeExecutionEnd(void) {
+  if (s_speculative_execution_depth != 0)
+    s_speculative_execution_depth--;
+}
+
+bool RtlSpeculativeExecutionActive(void) {
+  return s_speculative_execution_depth != 0;
+}
+
+uint32_t RtlSpeculativeExecutionViolation(void) {
+  return s_speculative_execution_violation;
+}
+
+void RtlSpeculativeExecutionReject(uint32_t violation) {
+  if (s_speculative_execution_depth != 0 &&
+      s_speculative_execution_violation == RTL_SPECULATIVE_VIOLATION_NONE)
+    s_speculative_execution_violation = violation;
+}
+
 // Axis-7 determinism: diagnostic per-frame WRAM fingerprint ring. FNV-1a of
 // the full 128 KiB g_ram each frame, keyed by frame number. Trace and co-sim
 // builds retain the forensic history; production omits both the hash and ring.
@@ -178,8 +212,11 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  * v6: beamMasterLast removed from the snes_saveload region (host-only
  *     timing anchor). v5 files still load via an 8-byte compat skip.
  * v7: manual joypad latch/shift state appended after the existing SNES blob.
- *     Older files initialize that transient serial state to idle. */
-#define RTL_SAV_VERSION 7u
+ *     Older files initialize that transient serial state to idle.
+ * v8: game extra chunks may append a versioned host-presentation payload.
+ *     DKC1 uses this to preserve its sparse widescreen margin history;
+ *     older v4-v7 snapshots still load and rebuild that cache cold. */
+#define RTL_SAV_VERSION 8u
 #define RTL_SAV_VERSION_MIN 4u
 
 typedef struct FileSli {
@@ -741,6 +778,10 @@ uint8 *RomPtr(uint32_t addr) {
 static int _writereg_ppu_count = 0;
 static int _writereg_dma_count = 0;
 void WriteReg(uint16 reg, uint8 value) {
+  if (RtlSpeculativeExecutionActive()) {
+    RtlSpeculativeExecutionReject(RTL_SPECULATIVE_VIOLATION_MMIO_WRITE);
+    return;
+  }
   // Direct dispatch — bypass emulator bus
   // MSU-1 ($2000-$2007). Inert unless a pack is armed, so the open-bus
   // default (no-op + log) is preserved byte-for-byte when disabled.
@@ -789,6 +830,10 @@ void WriteReg(uint16 reg, uint8 value) {
 
 
 uint8 ReadRegOpenBus(uint16 reg, uint8 open_bus) {
+  if (RtlSpeculativeExecutionActive()) {
+    RtlSpeculativeExecutionReject(RTL_SPECULATIVE_VIOLATION_MMIO_READ);
+    return open_bus;
+  }
   // Direct dispatch — bypass emulator bus
   // MSU-1 ($2000-$2007). An absent device leaves the data bus undriven.
   if (g_snes && cart_has_sa1(g_snes->cart) &&
@@ -835,6 +880,10 @@ uint8 ReadReg(uint16 reg) {
 }
 
 uint16 ReadRegWord(uint16 reg) {
+  if (RtlSpeculativeExecutionActive()) {
+    RtlSpeculativeExecutionReject(RTL_SPECULATIVE_VIOLATION_MMIO_READ);
+    return (uint16_t)g_cpu.open_bus | ((uint16_t)g_cpu.open_bus << 8);
+  }
   // APU port quirk: 16-bit CMP $2140 must see a CONSISTENT outPorts
   // snapshot. Two separate ReadReg calls would each catch the APU
   // up — between them the SPC could write only the LO byte (port 0)
@@ -1033,6 +1082,10 @@ void rtl_accumulate_apu_catchup(void) {
 
 void RtlApuWrite(uint16 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
+  if (RtlSpeculativeExecutionActive()) {
+    RtlSpeculativeExecutionReject(RTL_SPECULATIVE_VIOLATION_MMIO_WRITE);
+    return;
+  }
   uint8_t port = (uint8_t)(adr & 3);
 
 #ifdef SNES_COSIM
