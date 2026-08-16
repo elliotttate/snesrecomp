@@ -98,6 +98,13 @@ typedef struct WsShadowMarginStat {
    * shrugged off as a generic margin miss. originRebase counts window moves.
    * Set SNESRECOMP_WS_CACHE_LOG=<path> for a per-event jsonl detail log. */
   uint64_t outOfRangeRead, outOfRangeWrite, originRebase;
+  /* Stream retrodiction: a generated margin entry (prefill guess or exact
+   * decoder fill) that was actually SERVED to the renderer is compared
+   * against the game's own native capture when that world tile later
+   * enters the view. A mismatch proves wrong art was shown in the margin
+   * — decoder bug, stale cache, or world-key error — with the game itself
+   * as the oracle. Set SNESRECOMP_WS_RETRODICT=<path> for per-event jsonl. */
+  uint64_t retrodictChecked, retrodictMismatch;
 } WsShadowMarginStat;
 void WsShadowGetMarginStats(int layer, WsShadowMarginStat *out);
 

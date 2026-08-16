@@ -41,6 +41,10 @@ typedef struct WsShadowLayer {
   /* Exact decoder fill written through WsShadowForceTile. Authoritative for
    * ownership, but distinct from a live VRAM capture in debug provenance. */
   uint8_t *forceOrigin;
+  /* Generated cells that were actually served to the renderer — the set
+   * whose correctness the stream-retrodiction check can later prove or
+   * refute against the game's own native capture. */
+  uint8_t *served;
   uint32_t validCount;
   int blankTilePlus1;
   uint32_t lastTx0;
@@ -144,6 +148,8 @@ static void RecordDebugProvenance(int layer, int screenX, int screenY,
 
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry);
+static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
+                     uint16_t entry);
 
 /* ---- scene-local cache window --------------------------------------- */
 
@@ -207,6 +213,60 @@ static void AccountOobWrite(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
   CacheLog(li, layer, "oob_write", (int64_t)tx, (int64_t)ty);
 }
 
+/* Stream retrodiction: the game's own native capture is the oracle for
+ * every generated margin entry that was actually shown. */
+static void RetrodictLog(int layerIndex, const WsShadowLayer *layer,
+                         uint32_t tx, uint32_t ty, uint16_t served_entry,
+                         uint16_t actual_entry) {
+  static FILE *file;
+  static int checked;
+  static int frame_seen = -1;
+  static int lines_this_frame;
+  if (!checked) {
+    checked = 1;
+    const char *path_text = getenv("SNESRECOMP_WS_RETRODICT");
+    if (path_text && path_text[0])
+      file = fopen(path_text, "wb");
+  }
+  if (!file)
+    return;
+  if (frame_seen != snes_frame_counter) {
+    frame_seen = snes_frame_counter;
+    lines_this_frame = 0;
+  }
+  if (lines_this_frame++ >= 64)
+    return;
+  fprintf(file,
+          "{\"frame\":%d,\"layer\":%d,\"tile_x\":%u,\"tile_y\":%u,"
+          "\"served\":%u,\"actual\":%u,\"world_x\":%u,\"world_y\":%u}\n",
+          snes_frame_counter, layerIndex, tx, ty, served_entry, actual_entry,
+          layer->worldX, layer->worldY);
+  fflush(file);
+}
+
+/* Capture write from the game's real VRAM (view sweep / upload mirror).
+ * Before the truth lands, judge any generated-and-served prediction it
+ * replaces: a differing value proves wrong art was shown in the margin. */
+static void SetEntryLive(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
+                         uint16_t entry) {
+  uint32_t ltx, lty;
+  if (layer->entries && layer->served &&
+      LocalTile(layer, tx, ty, &ltx, &lty)) {
+    const uint32_t i = lty * kWsShadowXTiles + ltx;
+    const uint8_t bit = (uint8_t)(1u << (i & 7));
+    if ((layer->served[i >> 3] & bit) &&
+        (layer->valid[i >> 3] & bit)) {
+      const int li = LayerIndexOf(layer);
+      s_marginStats[li].retrodictChecked++;
+      if (layer->entries[i] != entry) {
+        s_marginStats[li].retrodictMismatch++;
+        RetrodictLog(li, layer, tx, ty, layer->entries[i], entry);
+      }
+    }
+  }
+  SetEntry(layer, tx, ty, entry);
+}
+
 static void ClearAllStore(WsShadowLayer *layer) {
   const size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
   if (layer->valid)
@@ -215,6 +275,8 @@ static void ClearAllStore(WsShadowLayer *layer) {
     memset(layer->guessOrigin, 0, count / 8);
   if (layer->forceOrigin)
     memset(layer->forceOrigin, 0, count / 8);
+  if (layer->served)
+    memset(layer->served, 0, count / 8);
   if (layer->cooldown)
     memset(layer->cooldown, 0, count);
   layer->validCount = 0;
@@ -254,12 +316,14 @@ static void RebaseStore(WsShadowLayer *layer, int64_t newTx, int64_t newTy) {
         uint8_t *valid_row = layer->valid + (size_t)ly * row_bits;
         uint8_t *guess_row = layer->guessOrigin + (size_t)ly * row_bits;
         uint8_t *force_row = layer->forceOrigin + (size_t)ly * row_bits;
+        uint8_t *served_row = layer->served + (size_t)ly * row_bits;
         uint8_t *cool_row = layer->cooldown + (size_t)ly * row_words;
         if (sy < 0 || sy >= kWsShadowYTiles) {
           memset(entry_row, 0, (size_t)row_words * 2);
           memset(valid_row, 0, (size_t)row_bits);
           memset(guess_row, 0, (size_t)row_bits);
           memset(force_row, 0, (size_t)row_bits);
+          memset(served_row, 0, (size_t)row_bits);
           memset(cool_row, 0, (size_t)row_words);
           continue;
         }
@@ -267,6 +331,7 @@ static void RebaseStore(WsShadowLayer *layer, int64_t newTx, int64_t newTy) {
         const uint8_t *src_v = layer->valid + (size_t)sy * row_bits;
         const uint8_t *src_g = layer->guessOrigin + (size_t)sy * row_bits;
         const uint8_t *src_f = layer->forceOrigin + (size_t)sy * row_bits;
+        const uint8_t *src_s = layer->served + (size_t)sy * row_bits;
         const uint8_t *src_c = layer->cooldown + (size_t)sy * row_words;
         if (dx >= 0) {
           const int keep = row_words - (int)dx;
@@ -281,6 +346,8 @@ static void RebaseStore(WsShadowLayer *layer, int64_t newTx, int64_t newTy) {
           memset(guess_row + keep_b, 0, (size_t)bx);
           memmove(force_row, src_f + bx, (size_t)keep_b);
           memset(force_row + keep_b, 0, (size_t)bx);
+          memmove(served_row, src_s + bx, (size_t)keep_b);
+          memset(served_row + keep_b, 0, (size_t)bx);
         } else {
           const int shift = (int)-dx;
           const int shift_b = -bx;
@@ -296,6 +363,8 @@ static void RebaseStore(WsShadowLayer *layer, int64_t newTx, int64_t newTy) {
           memset(guess_row, 0, (size_t)shift_b);
           memmove(force_row + shift_b, src_f, (size_t)keep_b);
           memset(force_row, 0, (size_t)shift_b);
+          memmove(served_row + shift_b, src_s, (size_t)keep_b);
+          memset(served_row, 0, (size_t)shift_b);
         }
       }
     }
@@ -399,6 +468,8 @@ static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
     layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
   if (layer->forceOrigin)
     layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
+  if (layer->served)
+    layer->served[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
 static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
@@ -417,6 +488,8 @@ static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
     layer->guessOrigin[i >> 3] |= (uint8_t)(1u << (i & 7));
   if (layer->forceOrigin)
     layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
+  if (layer->served)
+    layer->served[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
 static void SetEntryForced(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
@@ -470,6 +543,8 @@ static void ClearEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
     layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
   if (layer->forceOrigin)
     layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
+  if (layer->served)
+    layer->served[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
 static bool IsLiveOpaque(uint16_t tile) {
@@ -485,6 +560,8 @@ void WsShadowReset(void) {
       memset(layer->guessOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
     if (layer->forceOrigin)
       memset(layer->forceOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
+    if (layer->served)
+      memset(layer->served, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
     if (layer->cooldown)
       memset(layer->cooldown, 0, (size_t)kWsShadowXTiles * kWsShadowYTiles);
     layer->validCount = 0;
@@ -533,13 +610,15 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
     layer->valid = (uint8_t *)calloc(count / 8, 1);
     layer->guessOrigin = (uint8_t *)calloc(count / 8, 1);
     layer->forceOrigin = (uint8_t *)calloc(count / 8, 1);
+    layer->served = (uint8_t *)calloc(count / 8, 1);
     layer->cooldown = (uint8_t *)calloc(count, 1);
     if (!layer->entries || !layer->valid || !layer->guessOrigin ||
-        !layer->forceOrigin || !layer->cooldown) {
+        !layer->forceOrigin || !layer->served || !layer->cooldown) {
       free(layer->entries);
       free(layer->valid);
       free(layer->guessOrigin);
       free(layer->forceOrigin);
+      free(layer->served);
       free(layer->cooldown);
       memset(layer, 0, sizeof(*layer));
       return;
@@ -595,11 +674,18 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
       chunk = k0;
     else if ((uint32_t)(col >> 5) == (k0 & 1))
       chunk = k0;
+    else if (layer->dir < 0 && k0 > 0)
+      chunk = k0 - 1;
     else
-      chunk = layer->dir < 0 ? k0 - 1 : k0 + 1;
+      /* Staging "behind" chunk 0 does not exist; a mismatched half at the
+       * world's west edge can only be the chunk ahead. A stale leftward
+       * dir from the previous scene otherwise attributes level-entry
+       * uploads to chunk -1 and the capture is lost (surfaced by the
+       * scene-local window's out-of-range write accounting). */
+      chunk = k0 + 1;
     uint32_t tx = chunk * 32 + (uint32_t)(col & 31);
     uint32_t ty = WorldRowForMapRow(layer, row);
-    SetEntry(layer, tx, ty, value);
+    SetEntryLive(layer, tx, ty, value);
     /* Frame-stamp the game's own write so a respectGameWrites margin
      * refill yields to it (dynamic BG objects: platforms, elevators). */
     if (layer->respectGameWrites && layer->cooldown) {
@@ -1392,7 +1478,7 @@ void WsShadowFrame(const struct Ppu *ppu) {
             live_occ[li] = IsLiveOpaque(tile) ? 1 : 0;
           }
         } else {
-          SetEntry(layer, tx0 + (uint32_t)col, ty0 + (uint32_t)row, tile);
+          SetEntryLive(layer, tx0 + (uint32_t)col, ty0 + (uint32_t)row, tile);
         }
       }
     }
@@ -1544,8 +1630,8 @@ void WsShadowFrame(const struct Ppu *ppu) {
           if (east_echo)
             ClearEntry(layer, tx, (uint32_t)row);
           else
-            SetEntry(layer, tx, (uint32_t)row,
-                     live_e[row * kWsLiveMaxCols + col]);
+            SetEntryLive(layer, tx, (uint32_t)row,
+                         live_e[row * kWsLiveMaxCols + col]);
         }
       }
 
@@ -1681,6 +1767,13 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
       const uint32_t ty = (uint32_t)worldY >> shift;
       const bool generated = IsGuessOrigin(layer, tx, ty) ||
                              IsForceOrigin(layer, tx, ty);
+      if (generated && layer->served) {
+        uint32_t ltx, lty;
+        if (LocalTile(layer, tx, ty, &ltx, &lty)) {
+          const uint32_t cell = lty * kWsShadowXTiles + ltx;
+          layer->served[cell >> 3] |= (uint8_t)(1u << (cell & 7));
+        }
+      }
       RecordDebugProvenance(
           layerIndex, screenX, screenY, pixelSpan,
           generated ? kWsShadowProvenancePrefill
