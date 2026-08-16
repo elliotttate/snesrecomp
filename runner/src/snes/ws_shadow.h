@@ -2,6 +2,7 @@
 #define SNESRECOMP_WS_SHADOW_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Presentation-only, world-keyed BG tilemap storage for streaming games.
@@ -14,6 +15,16 @@ enum {
 };
 
 void WsShadowReset(void);
+
+/* Sparse host-presentation snapshot. Native SNES save states do not contain
+ * the world-keyed margin cache, so reloading used to erase the exact history
+ * that produced a live widescreen artifact. Games with a versioned extra
+ * save chunk can append this opaque blob and restore it before their
+ * post-load hook runs. The format is bounds-checked and self-describing;
+ * diagnostic provenance pixels are deliberately excluded. */
+size_t WsShadowSnapshotSize(void);
+bool WsShadowSnapshotSave(void *data, size_t size);
+bool WsShadowSnapshotLoad(const void *data, size_t size);
 
 /* True world-space camera origin for shadow keys (tile capture / margins).
  * For games where PPU scroll == camera (SMW-style), pass hScroll/vScroll.
@@ -132,6 +143,24 @@ uint8_t WsShadowDebugProvenanceAt(int layer, int screenX, int screenY);
  * diagnostic; world-keyed public APIs are unaffected by rebasing. */
 void WsShadowDebugOrigin(int layer, long long *originTx, long long *originTy);
 
+/* Per-cell last-writer attribution for the click-to-provenance inspector.
+ * Armed by SNESRECOMP_WS_WRITE_TRACE=1 (lazy, ~10 MB/layer). Returns 0
+ * when unarmed or the cell has no recorded writer; else a nonzero kind and
+ * the snes frame of the last write. Attribution is cleared on window
+ * rebase/scene reset (diagnostic data only). */
+typedef enum WsShadowWriteKind {
+  kWsShadowWriteNone = 0,
+  kWsShadowWriteViewCapture,   /* native view sweep from real VRAM */
+  kWsShadowWriteUploadMirror,  /* game's own VRAM upload (OnVramWrite) */
+  kWsShadowWriteDecodeForce,   /* exact ROM decoder fill (ForceTile) */
+  kWsShadowWritePrefillGuess,  /* CPU-side map guess (PrefillTile) */
+  kWsShadowWriteWestViewport,  /* west strip keyed by viewport row */
+  kWsShadowWriteBackfill,      /* backfill/shift/gap heuristics */
+} WsShadowWriteKind;
+int WsShadowDebugLastWriter(int layer, uint32_t worldTileX,
+                            uint32_t worldTileY, uint32_t *frame);
+const char *WsShadowWriteKindName(int kind);
+
 /* Read-only diagnostic lookup in the world-keyed store. This does not alter
  * hit/miss counters or renderer state. It lets offline route audits compare
  * the exact tilemap entry served in a margin with the entry later captured
@@ -164,6 +193,14 @@ void WsShadowPrefillTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
 /* Like PrefillTile but always writes (DMA-pad VRAM beats $7F guesses). */
 void WsShadowForceTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
                        uint16_t entry);
+
+/* Record an authoritative tile from the game's live rolling map. Unlike
+ * ForceTile this is captured provenance (not generated/prefilled data) and
+ * participates in retrodiction checks exactly like the ordinary viewport
+ * sweep. Hosts with checksum-verified wider cartridge streams can use this
+ * to ingest valid columns on both sides of the native viewport. */
+void WsShadowCaptureTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
+                         uint16_t entry);
 
 /* ForceTile yields to world cells the game itself wrote (via
  * WsShadowOnVramWrite) within the last `frames` frames (0 = off, max 250).
