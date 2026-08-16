@@ -58,6 +58,17 @@ typedef struct WsShadowLayer {
   bool rejectEastEcho;
   uint16_t retainMapBase;
   bool haveRetainMapBase;
+  /* Scene-local cache window. The flat store is indexed by
+   * (worldTile - origin); origins follow the camera in aligned steps so
+   * DKC-style high absolute coordinates (bonus rooms parked deep in the
+   * 16-bit map) stay cacheable. Alignment is 512 world pixels in X and
+   * 256 in Y, which preserves the SNES 32x32-entry screen parity (and the
+   * wide layer's 512px half parity) across any rebase. retainHistory
+   * layers keep originTy pinned at 0: their Y keys are viewport rows. */
+  int64_t originTx;
+  int64_t originTy;
+  uint8_t originShift; /* tileShift the origins were computed in */
+  bool haveOrigin;
   uint8_t *cooldown;
   uint16_t prevLive[kWsLiveMaxCols * kWsLiveMaxRows];
   uint8_t prevLiveOcc[kWsLiveMaxCols * kWsLiveMaxRows];
@@ -134,6 +145,224 @@ static void RecordDebugProvenance(int layer, int screenX, int screenY,
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry);
 
+/* ---- scene-local cache window --------------------------------------- */
+
+extern int snes_frame_counter;
+
+/* Env-gated jsonl detail log for cache-bound events (out-of-range keys and
+ * window rebases). Rate-limited per frame so a systematic failure cannot
+ * flood the disk; the always-on stats counters carry the full totals. */
+static void CacheLog(int layerIndex, const WsShadowLayer *layer,
+                     const char *event, int64_t tx, int64_t ty) {
+  static FILE *file;
+  static int checked;
+  static int frame_seen = -1;
+  static int lines_this_frame;
+  if (!checked) {
+    checked = 1;
+    const char *path = getenv("SNESRECOMP_WS_CACHE_LOG");
+    if (path && path[0])
+      file = fopen(path, "wb");
+  }
+  if (!file)
+    return;
+  if (frame_seen != snes_frame_counter) {
+    frame_seen = snes_frame_counter;
+    lines_this_frame = 0;
+  }
+  if (lines_this_frame++ >= 64)
+    return;
+  fprintf(file,
+          "{\"frame\":%d,\"layer\":%d,\"event\":\"%s\",\"tile_x\":%lld,"
+          "\"tile_y\":%lld,\"origin_tx\":%lld,\"origin_ty\":%lld,"
+          "\"world_x\":%u,\"world_y\":%u,\"tile_shift\":%u}\n",
+          snes_frame_counter, layerIndex, event, (long long)tx, (long long)ty,
+          (long long)layer->originTx, (long long)layer->originTy,
+          layer->worldX, layer->worldY,
+          (unsigned)(layer->tileShift ? layer->tileShift : 3));
+  fflush(file);
+}
+
+static int LayerIndexOf(const WsShadowLayer *layer) {
+  return (int)(layer - s_layers);
+}
+
+/* World tile -> store index space. False = outside the rebased window; the
+ * caller decides whether that is routine (pruning past the edge) or an
+ * accountable loss (a write or a margin serve). */
+static bool LocalTile(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
+                      uint32_t *ltx, uint32_t *lty) {
+  const int64_t lx = (int64_t)tx - layer->originTx;
+  const int64_t ly = (int64_t)ty - layer->originTy;
+  if (lx < 0 || lx >= kWsShadowXTiles || ly < 0 || ly >= kWsShadowYTiles)
+    return false;
+  *ltx = (uint32_t)lx;
+  *lty = (uint32_t)ly;
+  return true;
+}
+
+static void AccountOobWrite(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
+  const int li = LayerIndexOf(layer);
+  s_marginStats[li].outOfRangeWrite++;
+  CacheLog(li, layer, "oob_write", (int64_t)tx, (int64_t)ty);
+}
+
+static void ClearAllStore(WsShadowLayer *layer) {
+  const size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
+  if (layer->valid)
+    memset(layer->valid, 0, count / 8);
+  if (layer->guessOrigin)
+    memset(layer->guessOrigin, 0, count / 8);
+  if (layer->forceOrigin)
+    memset(layer->forceOrigin, 0, count / 8);
+  if (layer->cooldown)
+    memset(layer->cooldown, 0, count);
+  layer->validCount = 0;
+}
+
+/* Move stored content so existing world keys stay addressable after the
+ * origin steps to (newTx, newTy). Deltas are multiples of the 512px/256px
+ * alignment, so bitmap shifts stay byte-aligned. Content that falls off
+ * the window edge is dropped (it is beyond the retention span anyway). */
+static void RebaseStore(WsShadowLayer *layer, int64_t newTx, int64_t newTy) {
+  const int64_t dx = newTx - layer->originTx;
+  const int64_t dy = newTy - layer->originTy;
+  const int li = LayerIndexOf(layer);
+  s_marginStats[li].originRebase++;
+  CacheLog(li, layer, "rebase", newTx, newTy);
+  if (layer->entries) {
+    if (dx <= -kWsShadowXTiles || dx >= kWsShadowXTiles ||
+        dy <= -kWsShadowYTiles || dy >= kWsShadowYTiles) {
+      ClearAllStore(layer);
+    } else {
+      const int row_words = kWsShadowXTiles;
+      const int row_bits = kWsShadowXTiles / 8;
+      const int bx = (int)(dx >= 0 ? dx / 8 : -((-dx) / 8));
+      int ly0, ly1, step;
+      if (dy >= 0) {
+        ly0 = 0;
+        ly1 = kWsShadowYTiles;
+        step = 1;
+      } else {
+        ly0 = kWsShadowYTiles - 1;
+        ly1 = -1;
+        step = -1;
+      }
+      for (int ly = ly0; ly != ly1; ly += step) {
+        const int64_t sy = (int64_t)ly + dy;
+        uint16_t *entry_row = layer->entries + (size_t)ly * row_words;
+        uint8_t *valid_row = layer->valid + (size_t)ly * row_bits;
+        uint8_t *guess_row = layer->guessOrigin + (size_t)ly * row_bits;
+        uint8_t *force_row = layer->forceOrigin + (size_t)ly * row_bits;
+        uint8_t *cool_row = layer->cooldown + (size_t)ly * row_words;
+        if (sy < 0 || sy >= kWsShadowYTiles) {
+          memset(entry_row, 0, (size_t)row_words * 2);
+          memset(valid_row, 0, (size_t)row_bits);
+          memset(guess_row, 0, (size_t)row_bits);
+          memset(force_row, 0, (size_t)row_bits);
+          memset(cool_row, 0, (size_t)row_words);
+          continue;
+        }
+        const uint16_t *src_e = layer->entries + (size_t)sy * row_words;
+        const uint8_t *src_v = layer->valid + (size_t)sy * row_bits;
+        const uint8_t *src_g = layer->guessOrigin + (size_t)sy * row_bits;
+        const uint8_t *src_f = layer->forceOrigin + (size_t)sy * row_bits;
+        const uint8_t *src_c = layer->cooldown + (size_t)sy * row_words;
+        if (dx >= 0) {
+          const int keep = row_words - (int)dx;
+          const int keep_b = row_bits - bx;
+          memmove(entry_row, src_e + dx, (size_t)keep * 2);
+          memset(entry_row + keep, 0, (size_t)dx * 2);
+          memmove(cool_row, src_c + dx, (size_t)keep);
+          memset(cool_row + keep, 0, (size_t)dx);
+          memmove(valid_row, src_v + bx, (size_t)keep_b);
+          memset(valid_row + keep_b, 0, (size_t)bx);
+          memmove(guess_row, src_g + bx, (size_t)keep_b);
+          memset(guess_row + keep_b, 0, (size_t)bx);
+          memmove(force_row, src_f + bx, (size_t)keep_b);
+          memset(force_row + keep_b, 0, (size_t)bx);
+        } else {
+          const int shift = (int)-dx;
+          const int shift_b = -bx;
+          const int keep = row_words - shift;
+          const int keep_b = row_bits - shift_b;
+          memmove(entry_row + shift, src_e, (size_t)keep * 2);
+          memset(entry_row, 0, (size_t)shift * 2);
+          memmove(cool_row + shift, src_c, (size_t)keep);
+          memset(cool_row, 0, (size_t)shift);
+          memmove(valid_row + shift_b, src_v, (size_t)keep_b);
+          memset(valid_row, 0, (size_t)shift_b);
+          memmove(guess_row + shift_b, src_g, (size_t)keep_b);
+          memset(guess_row, 0, (size_t)shift_b);
+          memmove(force_row + shift_b, src_f, (size_t)keep_b);
+          memset(force_row, 0, (size_t)shift_b);
+        }
+      }
+    }
+  }
+  layer->originTx = newTx;
+  layer->originTy = newTy;
+}
+
+/* Keep the camera's view tile comfortably inside the window; establish or
+ * step the aligned origins when it drifts toward an edge. For worlds that
+ * never leave the window (origin 0), this is the identity mapping and the
+ * store behaves exactly as the pre-rebase engine. */
+static void EnsureOrigin(WsShadowLayer *layer) {
+  const unsigned sh = layer->tileShift ? layer->tileShift : 3;
+  const int64_t align_x = (int64_t)(512u >> sh);
+  const int64_t align_y = (int64_t)(256u >> sh);
+  const int64_t vx = (int64_t)(layer->worldX >> sh);
+  const int64_t vy = (int64_t)(layer->worldY >> sh);
+  const int64_t guard_x = kWsShadowXTiles / 8;
+  const int64_t guard_y = kWsShadowYTiles / 8;
+  bool stale = !layer->haveOrigin || layer->originShift != (uint8_t)sh;
+  if (!stale) {
+    const int64_t lx = vx - layer->originTx;
+    const int64_t ly = vy - layer->originTy;
+    const bool x_out = lx < guard_x || lx > kWsShadowXTiles - guard_x;
+    const bool y_out = !layer->retainHistory &&
+                       (ly < guard_y || ly > kWsShadowYTiles - guard_y);
+    if (!x_out && !y_out)
+      return;
+  }
+  int64_t want_tx = vx - kWsShadowXTiles / 2;
+  if (want_tx < 0)
+    want_tx = 0;
+  want_tx -= want_tx % align_x;
+  int64_t want_ty = 0;
+  if (!layer->retainHistory) {
+    want_ty = vy - kWsShadowYTiles / 2;
+    if (want_ty < 0)
+      want_ty = 0;
+    want_ty -= want_ty % align_y;
+  }
+  if (stale) {
+    /* Different tile size = different tile coordinate space entirely; any
+     * held content is unaddressable. Start the window clean. */
+    if (layer->haveOrigin && layer->entries)
+      ClearAllStore(layer);
+    layer->originTx = want_tx;
+    layer->originTy = want_ty;
+    layer->originShift = (uint8_t)sh;
+    layer->haveOrigin = true;
+    if (want_tx || want_ty)
+      CacheLog(LayerIndexOf(layer), layer, "origin_init", want_tx, want_ty);
+    return;
+  }
+  if (want_tx != layer->originTx || want_ty != layer->originTy)
+    RebaseStore(layer, want_tx, want_ty);
+}
+
+void WsShadowDebugOrigin(int layerIndex, long long *originTx,
+                         long long *originTy) {
+  const bool ok = layerIndex >= 0 && layerIndex < kLayers;
+  if (originTx)
+    *originTx = ok ? (long long)s_layers[layerIndex].originTx : 0;
+  if (originTy)
+    *originTy = ok ? (long long)s_layers[layerIndex].originTy : 0;
+}
+
 void WsShadowGetMarginStats(int layerIndex, WsShadowMarginStat *out) {
   if (!out)
     return;
@@ -152,15 +381,16 @@ bool WsShadowLookupWorldTile(int layerIndex, uint32_t worldTileX,
   return GetEntry(&s_layers[layerIndex], worldTileX, worldTileY, entry);
 }
 
-static bool InBounds(uint32_t tx, uint32_t ty) {
-  return tx < kWsShadowXTiles && ty < kWsShadowYTiles;
-}
-
 static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t entry) {
-  if (!layer->entries || !InBounds(tx, ty))
+  uint32_t ltx, lty;
+  if (!layer->entries)
     return;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  if (!LocalTile(layer, tx, ty, &ltx, &lty)) {
+    AccountOobWrite(layer, tx, ty);
+    return;
+  }
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   layer->entries[i] = entry;
   layer->valid[i >> 3] |= (uint8_t)(1u << (i & 7));
   /* Every non-prefill write is a capture (or an exact Force): it wins over
@@ -173,9 +403,14 @@ static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
 
 static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                           uint16_t entry) {
-  if (!layer->entries || !InBounds(tx, ty))
+  uint32_t ltx, lty;
+  if (!layer->entries)
     return;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  if (!LocalTile(layer, tx, ty, &ltx, &lty)) {
+    AccountOobWrite(layer, tx, ty);
+    return;
+  }
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   layer->entries[i] = entry;
   layer->valid[i >> 3] |= (uint8_t)(1u << (i & 7));
   if (layer->guessOrigin)
@@ -186,34 +421,38 @@ static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
 
 static void SetEntryForced(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                            uint16_t entry) {
+  uint32_t ltx, lty;
   SetEntry(layer, tx, ty, entry);
-  if (!layer->forceOrigin || !InBounds(tx, ty))
+  if (!layer->forceOrigin || !LocalTile(layer, tx, ty, &ltx, &lty))
     return;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   layer->forceOrigin[i >> 3] |= (uint8_t)(1u << (i & 7));
 }
 
 static bool IsGuessOrigin(const WsShadowLayer *layer, uint32_t tx,
                           uint32_t ty) {
-  if (!layer->guessOrigin || !InBounds(tx, ty))
+  uint32_t ltx, lty;
+  if (!layer->guessOrigin || !LocalTile(layer, tx, ty, &ltx, &lty))
     return false;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   return (layer->guessOrigin[i >> 3] & (1u << (i & 7))) != 0;
 }
 
 static bool IsForceOrigin(const WsShadowLayer *layer, uint32_t tx,
                           uint32_t ty) {
-  if (!layer->forceOrigin || !InBounds(tx, ty))
+  uint32_t ltx, lty;
+  if (!layer->forceOrigin || !LocalTile(layer, tx, ty, &ltx, &lty))
     return false;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   return (layer->forceOrigin[i >> 3] & (1u << (i & 7))) != 0;
 }
 
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry) {
-  if (!layer->entries || !InBounds(tx, ty))
+  uint32_t ltx, lty;
+  if (!layer->entries || !LocalTile(layer, tx, ty, &ltx, &lty))
     return false;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   if (!(layer->valid[i >> 3] & (1u << (i & 7))))
     return false;
   *entry = layer->entries[i];
@@ -221,9 +460,11 @@ static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
 }
 
 static void ClearEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
-  if (!layer->valid || !InBounds(tx, ty))
+  uint32_t ltx, lty;
+  /* Out-of-window clears are routine (pruning sweeps past the edges). */
+  if (!layer->valid || !LocalTile(layer, tx, ty, &ltx, &lty))
     return;
-  uint32_t i = ty * kWsShadowXTiles + tx;
+  uint32_t i = lty * kWsShadowXTiles + ltx;
   layer->valid[i >> 3] &= (uint8_t)~(1u << (i & 7));
   if (layer->guessOrigin)
     layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
@@ -254,6 +495,10 @@ void WsShadowReset(void) {
     layer->worldSet = false;
     layer->haveLastOrigin = false;
     layer->haveRetainMapBase = false;
+    layer->haveOrigin = false;
+    layer->originTx = 0;
+    layer->originTy = 0;
+    layer->originShift = 0;
     layer->havePrevLive = false;
     layer->prevLiveCols = 0;
     layer->prevLiveRows = 0;
@@ -357,10 +602,11 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
     SetEntry(layer, tx, ty, value);
     /* Frame-stamp the game's own write so a respectGameWrites margin
      * refill yields to it (dynamic BG objects: platforms, elevators). */
-    if (layer->respectGameWrites && layer->cooldown && InBounds(tx, ty)) {
-      extern int snes_frame_counter;
-      layer->cooldown[ty * kWsShadowXTiles + tx] =
-          (uint8_t)(snes_frame_counter & 0xFF);
+    if (layer->respectGameWrites && layer->cooldown) {
+      uint32_t ltx, lty;
+      if (LocalTile(layer, tx, ty, &ltx, &lty))
+        layer->cooldown[lty * kWsShadowXTiles + ltx] =
+            (uint8_t)(snes_frame_counter & 0xFF);
     }
   }
 }
@@ -431,6 +677,7 @@ void WsShadowPrefillTile(int layerIndex, uint32_t worldTileX,
   if (layer->retainHistory)
     return;
   if (layer->entries && (layer->active || layer->registered)) {
+    EnsureOrigin(layer);
     uint16_t cur;
     if (!GetEntry(layer, worldTileX, worldTileY, &cur)) {
       SetEntryGuess(layer, worldTileX, worldTileY, entry);
@@ -480,20 +727,22 @@ void WsShadowForceTile(int layerIndex, uint32_t worldTileX,
     return;
   if (!layer->entries || !(layer->active || layer->registered))
     return;
+  EnsureOrigin(layer);
   /* Yield to a recent game write (dynamic BG object drawn in the margin
    * through widened object windows). Stamp 0 doubles as "never written";
    * the 1-in-256 frame whose low byte is 0 merely skips one stamp. u8
    * stamps alias every 256 frames, so an ancient write can read fresh
    * for up to `respect` frames — it then serves the game's own captured
    * entry (real content, one-wrap old) rather than anything invented. */
-  if (layer->respectGameWrites && layer->cooldown &&
-      InBounds(worldTileX, worldTileY)) {
-    uint8_t stamp = layer->cooldown[worldTileY * kWsShadowXTiles + worldTileX];
-    if (stamp) {
-      extern int snes_frame_counter;
-      uint8_t age = (uint8_t)((snes_frame_counter & 0xFF) - stamp);
-      if (age <= (uint8_t)layer->respectGameWrites)
-        return;
+  if (layer->respectGameWrites && layer->cooldown) {
+    uint32_t ltx, lty;
+    if (LocalTile(layer, worldTileX, worldTileY, &ltx, &lty)) {
+      uint8_t stamp = layer->cooldown[lty * kWsShadowXTiles + ltx];
+      if (stamp) {
+        uint8_t age = (uint8_t)((snes_frame_counter & 0xFF) - stamp);
+        if (age <= (uint8_t)layer->respectGameWrites)
+          return;
+      }
     }
   }
   SetEntryForced(layer, worldTileX, worldTileY, entry);
@@ -604,8 +853,8 @@ static void ShiftWestViewportRows(WsShadowLayer *layer, uint32_t tx0, int dy,
   const int row_n = rows < kWsLiveMaxRows ? rows : kWsLiveMaxRows;
   const int west_keep = WestKeep(layer);
   for (int64_t tx = (int64_t)tx0 - west_keep; tx < (int64_t)tx0; tx++) {
-    if (tx < 0 || tx >= kWsShadowXTiles)
-      continue;
+    if (tx < 0)
+      continue; /* store bounds are enforced by the local-window transform */
     for (int r = 0; r < row_n; r++) {
       uint16_t e = 0;
       tmp_v[r] = GetEntry(layer, (uint32_t)tx, (uint32_t)r, &e) ? 1 : 0;
@@ -650,8 +899,8 @@ static void BackfillWestVacatedRows(WsShadowLayer *layer, uint32_t tx0,
 
   const int west_keep = WestKeep(layer);
   for (int64_t tx = (int64_t)tx0 - west_keep; tx < (int64_t)tx0; tx++) {
-    if (tx < 0 || tx >= kWsShadowXTiles)
-      continue;
+    if (tx < 0)
+      continue; /* store bounds are enforced by the local-window transform */
     int any = 0;
     for (int r = 0; r < row_n; r++) {
       uint16_t e = 0;
@@ -719,8 +968,8 @@ static void FillWestVerticalGapsFromLive(WsShadowLayer *layer, uint32_t tx0,
   const int west_keep = WestKeep(layer);
 
   for (int64_t tx = (int64_t)tx0 - west_keep; tx < (int64_t)tx0; tx++) {
-    if (tx < 0 || tx >= kWsShadowXTiles)
-      continue;
+    if (tx < 0)
+      continue; /* store bounds are enforced by the local-window transform */
     int dist = (int)((int64_t)tx0 - tx);
     int lc = dist - 1;
     if (lc < 0)
@@ -1092,6 +1341,9 @@ void WsShadowFrame(const struct Ppu *ppu) {
     layer->mapBaseWord = map_base_now;
 
     const unsigned sh = layer->tileShift;
+    /* tileShift is now authoritative for this frame: place or follow the
+     * scene-local window before any capture writes use it. */
+    EnsureOrigin(layer);
     const int view_cols = 256 >> sh;
     const unsigned phase = (unsigned)layer->worldX & ((1u << sh) - 1u);
     int cols = view_cols + (phase ? 1 : 0);
@@ -1318,7 +1570,7 @@ void WsShadowFrame(const struct Ppu *ppu) {
       const int64_t prune_hi = wx1 + east_keep + 8;
       const int64_t row_hi = (int64_t)rows + 4;
       for (int64_t tx = prune_lo; tx < prune_hi; tx++) {
-        if (tx < 0 || tx >= kWsShadowXTiles)
+        if (tx < 0)
           continue;
         if (tx >= wx0 - west_keep && tx < wx1 + east_keep)
           continue;
@@ -1396,7 +1648,21 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
                       (layer->scrollY & ((1u << shift) - 1)))
           : (int32_t)(layer->worldY +
                       ((wrappedY - layer->scrollY) & 0x3ff));
+  bool out_of_range = false;
   if (layer->entries && worldX >= 0 && worldY >= 0) {
+    uint32_t probe_x, probe_y;
+    /* A serve whose world key is outside the scene-local window is content
+     * loss, not a routine miss: count it, log it, and let the provenance
+     * overlay show it as its own class so it can never masquerade as
+     * generic culling. */
+    out_of_range = !LocalTile(layer, (uint32_t)worldX >> shift,
+                              (uint32_t)worldY >> shift, &probe_x, &probe_y);
+    if (out_of_range) {
+      s_marginStats[layerIndex].outOfRangeRead++;
+      CacheLog(layerIndex, layer, "oob_read",
+               (int64_t)((uint32_t)worldX >> shift),
+               (int64_t)((uint32_t)worldY >> shift));
+    }
     uint16_t entry;
     const bool hit = GetEntry(layer, (uint32_t)worldX >> shift,
                               (uint32_t)worldY >> shift, &entry);
@@ -1438,7 +1704,8 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
           else
             s_marginStats[layerIndex].eastFold++;
           RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                                kWsShadowProvenanceFold);
+                                out_of_range ? kWsShadowProvenanceOutOfRange
+                                         : kWsShadowProvenanceFold);
           return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
         }
         return realTile;  /* native column (or margin overlapping it) */
@@ -1452,7 +1719,8 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     else
       s_marginStats[layerIndex].eastBlank++;
     RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                          kWsShadowProvenanceBlank);
+                          out_of_range ? kWsShadowProvenanceOutOfRange
+                                       : kWsShadowProvenanceBlank);
     return (uint16_t)(layer->blankTilePlus1 - 1);
   }
   if (layer->rawContinuation && layer->wide) {
@@ -1461,7 +1729,9 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     else
       s_marginStats[layerIndex].eastRawContinuation++;
     RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                          kWsShadowProvenanceRawContinuation);
+                          out_of_range
+                              ? kWsShadowProvenanceOutOfRange
+                              : kWsShadowProvenanceRawContinuation);
     return realTile;
   }
   if (screenX < 0)
@@ -1469,7 +1739,8 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
   else
     s_marginStats[layerIndex].eastRawFallback++;
   RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                        kWsShadowProvenanceRawFallback);
+                        out_of_range ? kWsShadowProvenanceOutOfRange
+                                     : kWsShadowProvenanceRawFallback);
   return realTile;
 }
 

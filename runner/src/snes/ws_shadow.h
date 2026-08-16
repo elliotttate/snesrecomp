@@ -90,6 +90,14 @@ typedef struct WsShadowMarginStat {
   uint64_t westBlank, eastBlank;
   uint64_t westRawContinuation, eastRawContinuation;
   uint64_t westRawFallback, eastRawFallback;
+  /* Scene-local window accounting. The store is indexed by world tile MINUS
+   * a per-layer aligned origin that follows the camera, so high absolute
+   * world coordinates (bonus stages parked deep in the coordinate map) stay
+   * cacheable. outOfRange* count keys that still fell outside the rebased
+   * window — nonzero means content was lost and must be investigated, never
+   * shrugged off as a generic margin miss. originRebase counts window moves.
+   * Set SNESRECOMP_WS_CACHE_LOG=<path> for a per-event jsonl detail log. */
+  uint64_t outOfRangeRead, outOfRangeWrite, originRebase;
 } WsShadowMarginStat;
 void WsShadowGetMarginStats(int layer, WsShadowMarginStat *out);
 
@@ -104,11 +112,18 @@ typedef enum WsShadowProvenance {
   kWsShadowProvenanceBlank,
   kWsShadowProvenanceRawContinuation,
   kWsShadowProvenanceRawFallback,
+  /* The margin's world key fell outside the scene-local cache window; the
+   * art shown came from a fallback that cannot be world-correct. */
+  kWsShadowProvenanceOutOfRange,
 } WsShadowProvenance;
 void WsShadowDebugSetProvenanceEnabled(bool enabled);
 bool WsShadowDebugProvenanceEnabled(void);
 void WsShadowDebugBeginFrame(void);
 uint8_t WsShadowDebugProvenanceAt(int layer, int screenX, int screenY);
+
+/* Current scene-local origins (in tiles of the layer's tile size). Purely
+ * diagnostic; world-keyed public APIs are unaffected by rebasing. */
+void WsShadowDebugOrigin(int layer, long long *originTx, long long *originTy);
 
 /* Read-only diagnostic lookup in the world-keyed store. This does not alter
  * hit/miss counters or renderer state. It lets offline route audits compare
