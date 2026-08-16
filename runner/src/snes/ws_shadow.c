@@ -26,6 +26,12 @@ typedef struct WsShadowLayer {
   uint8_t tileShift; /* 3 = 8x8 map entries, 4 = 16x16 big tiles */
   uint32_t worldX;
   uint32_t worldY;
+  /* Cartridge-authentic viewport origin. Presentation can move worldX/Y
+   * without changing which 256px strip the game actually populated. */
+  uint32_t captureWorldX;
+  uint32_t captureWorldY;
+  uint8_t nativeInsetLeft;
+  uint8_t nativeInsetRight;
   uint32_t scrollX;
   uint32_t scrollY;
   uint16_t mapBaseWord;
@@ -114,7 +120,10 @@ static uint8_t
 
 enum {
   kWsSnapshotMagic = 0x48535357u, /* "WSSH" */
-  kWsSnapshotVersion = 1,
+  /* v2 separates presentation-world lookup coordinates from the authentic
+   * cartridge viewport captured from VRAM. v1 cells may be keyed by a host
+   * edge bias and must be rebuilt rather than silently restored. */
+  kWsSnapshotVersion = 2,
 };
 
 typedef struct WsShadowSnapshotHeader {
@@ -724,6 +733,10 @@ void WsShadowReset(void) {
     layer->fold = false;
     layer->rawContinuation = false;
     layer->worldSet = false;
+    layer->captureWorldX = 0;
+    layer->captureWorldY = 0;
+    layer->nativeInsetLeft = 0;
+    layer->nativeInsetRight = 0;
     layer->haveLastOrigin = false;
     layer->haveRetainMapBase = false;
     layer->haveOrigin = false;
@@ -870,6 +883,14 @@ static void RestoreLayerState(WsShadowLayer *layer,
   layer->tileShift = (uint8_t)state->tileShift;
   layer->worldX = state->worldX;
   layer->worldY = state->worldY;
+  /* Capture coordinates and native insets are derived from the current PPU
+   * and host presentation bias every frame; they are deliberately not
+   * serialized. Start a restored v2 snapshot from the conservative ordinary
+   * viewport until its first DKC prepare pass publishes the exact values. */
+  layer->captureWorldX = state->worldX;
+  layer->captureWorldY = state->worldY;
+  layer->nativeInsetLeft = 0;
+  layer->nativeInsetRight = 0;
   layer->scrollX = state->scrollX;
   layer->scrollY = state->scrollY;
   layer->mapBaseWord = (uint16_t)state->mapBaseWord;
@@ -991,8 +1012,34 @@ void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
     layer->dir = ((int32_t)(worldX - layer->worldX) > 0) ? 1 : -1;
   layer->worldX = worldX;
   layer->worldY = worldY;
+  layer->captureWorldX = worldX;
+  layer->captureWorldY = worldY;
+  layer->nativeInsetLeft = 0;
+  layer->nativeInsetRight = 0;
   layer->scrollX = worldX;
   layer->scrollY = worldY;
+}
+
+void WsShadowSetCaptureWorld(int layerIndex, uint32_t worldX,
+                             uint32_t worldY) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  layer->captureWorldX = worldX;
+  layer->captureWorldY = worldY;
+}
+
+void WsShadowSetNativeViewportInset(int layerIndex, int leftPixels,
+                                    int rightPixels) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  if (leftPixels < 0) leftPixels = 0;
+  if (rightPixels < 0) rightPixels = 0;
+  if (leftPixels > 255) leftPixels = 255;
+  if (rightPixels > 255) rightPixels = 255;
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  layer->nativeInsetLeft = (uint8_t)leftPixels;
+  layer->nativeInsetRight = (uint8_t)rightPixels;
 }
 
 void WsShadowSetScroll(int layerIndex, uint32_t scrollX, uint32_t scrollY) {
@@ -1006,7 +1053,7 @@ void WsShadowSetScroll(int layerIndex, uint32_t scrollX, uint32_t scrollY) {
 /* World y-tile for a map row, using the anchor's 32-row wrap window. */
 static uint32_t WorldRowForMapRow(const WsShadowLayer *layer, int row) {
   const unsigned sh = layer->tileShift ? layer->tileShift : 3;
-  uint32_t wy0 = layer->worldY >> sh;
+  uint32_t wy0 = layer->captureWorldY >> sh;
   return wy0 + (uint32_t)((row - (int)(wy0 & 31)) & 31);
 }
 
@@ -1029,7 +1076,7 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
         (off & 0x1f) | (layer->wide && (off & 0x400) ? 0x20 : 0);
     int row = (off >> 5) & 0x1f;
     const unsigned sh = layer->tileShift ? layer->tileShift : 3;
-    uint32_t k0 = layer->worldX >> (sh + 5);
+    uint32_t k0 = layer->captureWorldX >> (sh + 5);
     uint32_t chunk;
     if (!layer->wide)
       chunk = k0;
@@ -1819,7 +1866,8 @@ void WsShadowFrame(const struct Ppu *ppu) {
      * scene-local window before any capture writes use it. */
     EnsureOrigin(layer);
     const int view_cols = 256 >> sh;
-    const unsigned phase = (unsigned)layer->worldX & ((1u << sh) - 1u);
+    const unsigned phase =
+        (unsigned)layer->captureWorldX & ((1u << sh) - 1u);
     int cols = view_cols + (phase ? 1 : 0);
     if (layer->captureCols > cols)
       cols = layer->captureCols;
@@ -1829,8 +1877,8 @@ void WsShadowFrame(const struct Ppu *ppu) {
     if (cols > kWsLiveMaxCols)
       cols = kWsLiveMaxCols;
     const int rows = sh == 4 ? 16 : 29;
-    const uint32_t tx0 = layer->worldX >> sh;
-    const uint32_t ty0 = layer->worldY >> sh;
+    const uint32_t tx0 = layer->captureWorldX >> sh;
+    const uint32_t ty0 = layer->captureWorldY >> sh;
     const uint32_t buf_tx0 = layer->scrollX >> sh;
     const uint32_t buf_ty0 = layer->scrollY >> sh;
     const int x_mask = layer->wide ? 63 : 31;
@@ -2101,8 +2149,11 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
    * an exact one-tile seam before margin rendering begins.
    */
   const int tile_pixels = 1 << (layer->tileShift ? layer->tileShift : 3);
+  const int native_left = layer->nativeInsetLeft;
+  const int native_right = 256 - layer->nativeInsetRight;
   if (!layer->active ||
-      (screenX >= 0 && screenX + tile_pixels <= 256))
+      (screenX >= native_left &&
+       screenX + tile_pixels <= native_right))
     return realTile;
 
   /* Layered margin sources, exact-first: (1) the world-keyed history —

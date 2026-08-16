@@ -179,6 +179,19 @@ int WsShadowDebugCell(int layer, uint32_t worldTileX, uint32_t worldTileY,
  * phantoms (e.g. a second door) in the right widescreen gutter. */
 void WsShadowSetRejectEastEcho(int layer, bool reject);
 
+/* Separate the cartridge-authentic viewport captured from VRAM from the
+ * host presentation viewport used for margin lookup. Most callers leave
+ * these equal via WsShadowSetWorld. A host that shifts presentation near a
+ * level boundary must override the capture origin so stale ring headroom is
+ * not mislabeled as authoritative world data. */
+void WsShadowSetCaptureWorld(int layer, uint32_t worldX, uint32_t worldY);
+
+/* Pixels removed from the authentic native source interval by a host-only
+ * presentation shift. Tile chunks touching either inset are resolved from
+ * world-keyed shadow data even though their destination X is still 0..255. */
+void WsShadowSetNativeViewportInset(int layer, int leftPixels,
+                                    int rightPixels);
+
 // Supply a raw tilemap entry resolved from the game's CPU-side map for a
 // world tile. This is useful when a game retains full room data in WRAM but
 // streams only the native viewport to VRAM. It changes renderer-side state
