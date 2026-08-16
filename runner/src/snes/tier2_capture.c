@@ -90,9 +90,17 @@ static void init_paths(const char *rom_title) {
     snprintf(s_capture_id, sizeof s_capture_id, "%s_%s_p%ld",
              romid, stamp, (long)tier2_getpid());
 
+    /* Default-named captures land in SNESRECOMP_TIER2_DIR when set, so
+     * long-running debug sessions do not sprinkle stamped files across
+     * whatever directory the host happened to run from. Explicit
+     * MANIFEST/JOURNAL paths are used verbatim, as before. */
+    const char *dir = getenv("SNESRECOMP_TIER2_DIR");
     const char *manifest = getenv("SNESRECOMP_TIER2_MANIFEST");
     if (manifest && *manifest)
         snprintf(s_manifest_path, sizeof s_manifest_path, "%s", manifest);
+    else if (dir && *dir)
+        snprintf(s_manifest_path, sizeof s_manifest_path,
+                 "%s/tier2_%s.json", dir, s_capture_id);
     else
         snprintf(s_manifest_path, sizeof s_manifest_path,
                  "tier2_%s.json", s_capture_id);
