@@ -2,6 +2,186 @@
 
 #include "cpu_trace.h"
 
+#if SNESRECOMP_TRACE || SNESRECOMP_FUNC_ENTRY_HOOK
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+/* ---- function-entry profiling + WRAM watchpoints (trace/hook builds) ------
+ *
+ * Both are env-gated and zero-cost when unset. They piggyback on the
+ * per-function-entry hook, so granularity is the traced function window:
+ * a watched change is attributed to the function whose body (including
+ * untraced leaf work) executed since the previous entry.
+ *
+ *   SNESRECOMP_FUNC_PROFILE=<path>    per-function call counts + frame
+ *       span + up to 4 distinct context values, dumped as jsonl at exit.
+ *   SNESRECOMP_PROFILE_CONTEXT_ADDR=<hex WRAM offset>  16-bit context
+ *       word sampled per call (game-agnostic; DKC1 uses 0032 = mode).
+ *   SNESRECOMP_WATCH=<hexaddr>:<len>[,...]   WRAM ranges to watch
+ *       (total capped at 4 KiB).
+ *   SNESRECOMP_WATCH_LOG=<path>       watch events jsonl (default stderr).
+ */
+enum { kProfSlots = 16384, kWatchMaxBytes = 4096, kWatchMaxRanges = 16 };
+
+typedef struct ProfEntry {
+    uint32_t pc24;            /* 0 = empty */
+    const char *name;
+    uint64_t calls;
+    int32_t first_frame, last_frame;
+    uint16_t contexts[4];
+    uint8_t context_count;
+} ProfEntry;
+
+static ProfEntry *g_prof_table;
+static FILE *g_prof_out;
+static int g_prof_context_addr = -1;
+
+typedef struct WatchRange {
+    uint32_t addr, len;
+} WatchRange;
+
+static WatchRange g_watch_ranges[kWatchMaxRanges];
+static int g_watch_range_count;
+static uint8_t g_watch_shadow[kWatchMaxBytes];
+static int g_watch_shadow_valid;
+static FILE *g_watch_out;
+static uint32_t g_watch_prev_pc;
+static const char *g_watch_prev_name;
+static int g_watch_lines_this_frame;
+static int g_watch_frame_seen = -1;
+
+static void prof_dump_at_exit(void) {
+    if (!g_prof_out || !g_prof_table) return;
+    for (int i = 0; i < kProfSlots; i++) {
+        ProfEntry *e = &g_prof_table[i];
+        if (!e->pc24) continue;
+        fprintf(g_prof_out,
+                "{\"pc24\":\"0x%06X\",\"name\":\"%s\",\"calls\":%llu,"
+                "\"first_frame\":%d,\"last_frame\":%d,\"contexts\":[",
+                e->pc24, e->name ? e->name : "?",
+                (unsigned long long)e->calls, e->first_frame, e->last_frame);
+        for (int c = 0; c < e->context_count; c++)
+            fprintf(g_prof_out, "%s%u", c ? "," : "", e->contexts[c]);
+        fprintf(g_prof_out, "]}\n");
+    }
+    fclose(g_prof_out);
+    g_prof_out = NULL;
+}
+
+static void prof_watch_init_once(void) {
+    static int initialized = 0;
+    if (initialized) return;
+    initialized = 1;
+    const char *prof_path = getenv("SNESRECOMP_FUNC_PROFILE");
+    if (prof_path && prof_path[0]) {
+        g_prof_out = fopen(prof_path, "wb");
+        if (g_prof_out) {
+            g_prof_table = (ProfEntry *)calloc(kProfSlots, sizeof(ProfEntry));
+            atexit(prof_dump_at_exit);
+            const char *ctx = getenv("SNESRECOMP_PROFILE_CONTEXT_ADDR");
+            if (ctx && ctx[0])
+                g_prof_context_addr = (int)strtol(ctx, NULL, 16) & 0x1FFFF;
+        }
+    }
+    const char *watch_spec = getenv("SNESRECOMP_WATCH");
+    if (watch_spec && watch_spec[0]) {
+        uint32_t total = 0;
+        const char *cursor = watch_spec;
+        while (*cursor && g_watch_range_count < kWatchMaxRanges) {
+            char *end = NULL;
+            uint32_t addr = (uint32_t)strtoul(cursor, &end, 16) & 0x1FFFF;
+            uint32_t len = 2;
+            if (end && *end == ':')
+                len = (uint32_t)strtoul(end + 1, &end, 16);
+            if (len == 0) len = 1;
+            if (total + len > kWatchMaxBytes) break;
+            g_watch_ranges[g_watch_range_count].addr = addr;
+            g_watch_ranges[g_watch_range_count].len = len;
+            g_watch_range_count++;
+            total += len;
+            if (!end || *end != ',') break;
+            cursor = end + 1;
+        }
+        const char *log_path = getenv("SNESRECOMP_WATCH_LOG");
+        g_watch_out = (log_path && log_path[0]) ? fopen(log_path, "wb")
+                                                : stderr;
+    }
+}
+
+static void prof_watch_on_entry(CpuState *cpu, uint32_t pc24,
+                                const char *name) {
+    extern uint8_t g_ram[0x20000];
+    extern int snes_frame_counter;
+    (void)cpu;
+    prof_watch_init_once();
+
+    if (g_prof_table) {
+        uint32_t slot = (pc24 * 2654435761u) & (kProfSlots - 1);
+        for (int probe = 0; probe < kProfSlots; probe++) {
+            ProfEntry *e = &g_prof_table[slot];
+            if (e->pc24 == pc24 || e->pc24 == 0) {
+                if (e->pc24 == 0) {
+                    e->pc24 = pc24;
+                    e->name = name;
+                    e->first_frame = snes_frame_counter;
+                }
+                e->calls++;
+                e->last_frame = snes_frame_counter;
+                if (g_prof_context_addr >= 0 && e->context_count < 4) {
+                    uint16_t ctx = (uint16_t)(g_ram[g_prof_context_addr] |
+                        (g_ram[g_prof_context_addr + 1] << 8));
+                    int seen = 0;
+                    for (int c = 0; c < e->context_count; c++)
+                        if (e->contexts[c] == ctx) seen = 1;
+                    if (!seen)
+                        e->contexts[e->context_count++] = ctx;
+                }
+                break;
+            }
+            slot = (slot + 1) & (kProfSlots - 1);
+        }
+    }
+
+    if (g_watch_range_count) {
+        if (g_watch_frame_seen != snes_frame_counter) {
+            g_watch_frame_seen = snes_frame_counter;
+            g_watch_lines_this_frame = 0;
+        }
+        uint32_t offset = 0;
+        for (int r = 0; r < g_watch_range_count; r++) {
+            const WatchRange *range = &g_watch_ranges[r];
+            if (g_watch_shadow_valid &&
+                memcmp(g_watch_shadow + offset, g_ram + range->addr,
+                       range->len) != 0) {
+                for (uint32_t i = 0; i < range->len; i++) {
+                    uint8_t old_value = g_watch_shadow[offset + i];
+                    uint8_t new_value = g_ram[range->addr + i];
+                    if (old_value == new_value) continue;
+                    if (g_watch_out &&
+                        g_watch_lines_this_frame++ < 256)
+                        fprintf(g_watch_out,
+                                "{\"frame\":%d,\"addr\":\"0x%05X\","
+                                "\"old\":\"0x%02X\",\"new\":\"0x%02X\","
+                                "\"writer_pc\":\"0x%06X\","
+                                "\"writer\":\"%s\"}\n",
+                                snes_frame_counter, range->addr + i,
+                                old_value, new_value, g_watch_prev_pc,
+                                g_watch_prev_name ? g_watch_prev_name : "?");
+                }
+                if (g_watch_out) fflush(g_watch_out);
+            }
+            memcpy(g_watch_shadow + offset, g_ram + range->addr, range->len);
+            offset += range->len;
+        }
+        g_watch_shadow_valid = 1;
+        g_watch_prev_pc = pc24;
+        g_watch_prev_name = name;
+    }
+}
+
+#endif /* SNESRECOMP_TRACE || SNESRECOMP_FUNC_ENTRY_HOOK */
+
 #if SNESRECOMP_TRACE
 
 #include "debug_server.h"
@@ -1309,6 +1489,7 @@ static uint32_t fnv1a(const char *s) {
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
     if (g_freeze_capture) return;  /* deliberate inspection-freeze */
+    prof_watch_on_entry(cpu, pc24, name);
     /* Investigation (env-gated): log DB/PB at every function entry inside a
      * frame window so a data-bank divergence can be located by chain.
      * SNESRECOMP_DBTRACE="lo-hi". Off by default, zero cost when unset. */
@@ -2603,3 +2784,11 @@ void cpu_trace_dump_dbpb(const char *tag) {
 }
 
 #endif /* SNESRECOMP_TRACE */
+
+#if !SNESRECOMP_TRACE && SNESRECOMP_FUNC_ENTRY_HOOK
+/* Lean hook build: generated code's cpu_trace_func_entry calls resolve
+ * here; every other trace hook stays a header no-op. */
+void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
+    prof_watch_on_entry(cpu, pc24, name);
+}
+#endif

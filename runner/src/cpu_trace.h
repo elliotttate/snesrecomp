@@ -37,6 +37,14 @@ extern "C" {
 #define SNESRECOMP_TRACE 0
 #endif
 
+/* Lean per-function-entry hook: compiles ONLY cpu_trace_func_entry (for
+ * profiling and WRAM watchpoints) without the full trace machinery the
+ * generated code otherwise pulls in (block/px/pb rings, debug server).
+ * Implied by SNESRECOMP_TRACE. */
+#ifndef SNESRECOMP_FUNC_ENTRY_HOOK
+#define SNESRECOMP_FUNC_ENTRY_HOOK 0
+#endif
+
 /* Event-type IDs for the targeted hooks. */
 enum {
     CPU_TR_BLOCK    = 0,   /* basic-block entry */
@@ -1314,7 +1322,11 @@ void cpu_trace_dump_wram(const char *tag, int scan_n);
 #else  /* SNESRECOMP_TRACE = 0 */
 
 static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24)            { (void)cpu; (void)pc24; }
+#if SNESRECOMP_FUNC_ENTRY_HOOK
+void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name);
+#else
 static inline void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) { (void)cpu; (void)pc24; (void)name; }
+#endif
 static inline void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t et,
                                    uint8_t e0, uint16_t e1)                 { (void)cpu; (void)pc24; (void)et; (void)e0; (void)e1; }
 static inline void cpu_trace_db_change(CpuState *cpu, uint32_t pc24, uint8_t o,
