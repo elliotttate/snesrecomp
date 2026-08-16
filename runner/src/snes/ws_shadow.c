@@ -20,6 +20,7 @@ typedef struct WsShadowLayer {
   bool active;
   bool wide;
   bool fold;      /* periodic fold enabled (composes with world history) */
+  bool rawContinuation; /* unresolved margins use valid 64-column map data */
   bool worldSet;  /* WsShadowSetWorld called this frame */
   int dir;        /* last nonzero worldX motion: +1 right, -1 left */
   uint8_t tileShift; /* 3 = 8x8 map entries, 4 = 16x16 big tiles */
@@ -249,6 +250,7 @@ void WsShadowReset(void) {
     layer->registered = false;
     layer->active = false;
     layer->fold = false;
+    layer->rawContinuation = false;
     layer->worldSet = false;
     layer->haveLastOrigin = false;
     layer->haveRetainMapBase = false;
@@ -268,6 +270,12 @@ void WsShadowSetPeriodicFold(int layerIndex) {
   /* Composable with WsShadowSetWorld: rows with a detected period fold
    * to fresh native columns; the remaining (world-anchored) rows fall
    * through to the world-keyed history, then to the plain map wrap. */
+}
+
+void WsShadowSetRawContinuation(int layerIndex, bool enabled) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  s_layers[layerIndex].rawContinuation = enabled;
 }
 
 void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
@@ -1446,6 +1454,15 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
                           kWsShadowProvenanceBlank);
     return (uint16_t)(layer->blankTilePlus1 - 1);
+  }
+  if (layer->rawContinuation && layer->wide) {
+    if (screenX < 0)
+      s_marginStats[layerIndex].westRawContinuation++;
+    else
+      s_marginStats[layerIndex].eastRawContinuation++;
+    RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
+                          kWsShadowProvenanceRawContinuation);
+    return realTile;
   }
   if (screenX < 0)
     s_marginStats[layerIndex].westRawFallback++;

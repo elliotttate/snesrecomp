@@ -96,6 +96,13 @@ enum {
   kPpuRenderFlags_NewRenderer = 1,
   // Preserve the established bit value for config/save compatibility.
   kPpuRenderFlags_NoSpriteLimits = 8,
+  /* Opt-in host policy for a genuinely wider playfield. The SNES fetches at
+   * most 32 sprites / 34 8-pixel OBJ slivers across its 256 columns. A host
+   * that exposes additional world columns may grant one extra slot of each
+   * budget per additional 8-pixel column. With no live side columns this is
+   * bit-for-bit the native limit; centered fixed screens therefore remain
+   * authentic. */
+  kPpuRenderFlags_WidescreenSpriteBudget = 16,
 };
 
 typedef struct Layer {

@@ -2011,6 +2011,17 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   int spritesFound = 0;
   int tilesFound = 0;
   uint8_t foundSprites[128];
+  int widescreenBudget = 0;
+  if (ppu->renderFlags & kPpuRenderFlags_WidescreenSpriteBudget) {
+    /* A partial 8-pixel margin column can contain a visible OBJ sliver, so
+     * round the combined live side width upward. `extraLeftRight` is only a
+     * framebuffer centering budget; use the live per-side widths so a
+     * pillarboxed title/menu cannot silently relax the hardware limit. */
+    widescreenBudget =
+        (ppu->extraLeftCur + ppu->extraRightCur + 7) / 8;
+  }
+  const int spriteLimit = 32 + widescreenBudget;
+  const int tileLimit = 34 + widescreenBudget;
 
   // Range evaluation walks OAM forward, but tile fetching walks the accepted
   // sprites backward. This is observable when the 34-sliver limit is reached.
@@ -2029,10 +2040,10 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
               : ppu->extraLeftCur;
       if(x + spriteSize > -left_extra) {
         spritesFound++;
-        if(spritesFound > 32 &&
+        if(spritesFound > spriteLimit &&
            !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
           ppu->rangeOver = true;
-          spritesFound = 32;
+          spritesFound = spriteLimit;
           break;
         }
         foundSprites[spritesFound - 1] = index;
@@ -2068,7 +2079,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
          col + x >= 256 + right_extra)
         continue;
             tilesFound++;
-            if(tilesFound > 34 &&
+            if(tilesFound > tileLimit &&
                !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
               ppu->timeOver = true;
               break;
@@ -2111,7 +2122,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                 dst[0] = z + pixel;
             }
         }
-        if(tilesFound > 34 &&
+        if(tilesFound > tileLimit &&
            !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
       break;
   }

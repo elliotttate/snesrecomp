@@ -36,6 +36,14 @@ void WsShadowSetBlankTile(int layer, int blankEntry);
 // WsShadowSetWorld for the same layer (the last registration wins).
 void WsShadowSetPeriodicFold(int layer);
 
+/* Permit a widened 64-column tilemap layer to serve the exact map entry the
+ * PPU already resolved outside the native 256-pixel viewport. This is for
+ * independently-authored parallax planes whose second tilemap screen is
+ * valid content, not a circular streaming buffer. It is deliberately
+ * accounted separately from RawFallback so enabling it cannot hide an
+ * unsafe terrain-ring miss from regression tooling. */
+void WsShadowSetRawContinuation(int layer, bool enabled);
+
 /* Keep world-keyed entries across frames instead of clearing every present.
  * The viewport capture still overwrites in-view tiles each frame, so only
  * off-view margins read history. History is dropped automatically when the
@@ -80,6 +88,7 @@ typedef struct WsShadowMarginStat {
    * folded, or verified-blank source was available. */
   uint64_t westFold, eastFold;
   uint64_t westBlank, eastBlank;
+  uint64_t westRawContinuation, eastRawContinuation;
   uint64_t westRawFallback, eastRawFallback;
 } WsShadowMarginStat;
 void WsShadowGetMarginStats(int layer, WsShadowMarginStat *out);
@@ -93,6 +102,7 @@ typedef enum WsShadowProvenance {
   kWsShadowProvenancePrefill,
   kWsShadowProvenanceFold,
   kWsShadowProvenanceBlank,
+  kWsShadowProvenanceRawContinuation,
   kWsShadowProvenanceRawFallback,
 } WsShadowProvenance;
 void WsShadowDebugSetProvenanceEnabled(bool enabled);

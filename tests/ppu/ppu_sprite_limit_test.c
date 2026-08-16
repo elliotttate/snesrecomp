@@ -66,8 +66,42 @@ static void no_op_line_enhancer(Ppu *ppu, uint y, bool sub, void *context) {
     (void)context;
 }
 
+static void setup_35_sliver_case(Ppu *ppu) {
+    for (int slot = 0; slot < 128; slot++)
+        ppu->oam[slot * 2] = 0xf000;
+    memset(ppu->highOam, 0, sizeof ppu->highOam);
+    ppu->obsel = 2 << 5;  /* size pair 8x8 / 64x64 */
+    /* Fetch order is reversed. Slots 1..4 contribute 32 slivers and slots
+     * 5..6 contribute two more, so native fetch drops slot 0 as sliver 35. */
+    ppu->oam[0] = 0x0000;
+    for (int slot = 1; slot <= 6; slot++) {
+        ppu->oam[slot * 2] = 0x0040;
+        if (slot <= 4) {
+            int high_byte = slot >> 2;
+            int size_bit = ((slot & 3) * 2) + 1;
+            ppu->highOam[high_byte] |= (uint8_t)(1u << size_bit);
+        }
+    }
+    for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
+        ppu->vram[i] = 0xffff;
+}
+
+static void setup_33_sprite_case(Ppu *ppu) {
+    for (int slot = 0; slot < 128; slot++)
+        ppu->oam[slot * 2] = 0xf000;
+    memset(ppu->highOam, 0, sizeof ppu->highOam);
+    ppu->obsel = 0;  /* 8x8 / 16x16; all entries use the small size */
+    for (int slot = 0; slot < 33; slot++)
+        ppu->oam[slot * 2] = 0x0040;
+    for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
+        ppu->vram[i] = 0xffff;
+}
+
 int main(void) {
-    enum { kPitch = kPpuXPixels * 4 };
+    /* The shared scratch surface must also hold the live-margin cases below;
+     * PPU priority buffers are wider than native even when the first tests
+     * only inspect their OBJ plane. */
+    enum { kTestExtra = 8, kPitch = (kPpuXPixels + kTestExtra * 2) * 4 };
     uint8_t pixels[kPitch];
     Ppu *ppu = ppu_init();
     int failures = 0;
@@ -107,6 +141,61 @@ int main(void) {
     ppu_runLine(ppu, 1);
     failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) != 0,
                       "disabling sprite limits renders the low slot");
+
+    /* A live widened world gets only the capacity represented by its added
+     * columns. The same flag with zero live columns (including a centered
+     * fixed screen) must retain the exact native limits. */
+    ppu_reset(ppu);
+    PpuBeginDrawing(ppu, pixels, kPitch,
+                    kPpuRenderFlags_NewRenderer |
+                    kPpuRenderFlags_WidescreenSpriteBudget);
+    PpuSetExtraSpaceCentered(ppu, 8);
+    ppu->inidisp = 0x0f;
+    setup_35_sliver_case(ppu);
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
+    failures += check(ppu->timeOver,
+                      "centered widescreen keeps native 34-sliver limit");
+    failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) == 0,
+                      "centered widescreen still drops sliver 35");
+
+    ppu_reset(ppu);
+    PpuBeginDrawing(ppu, pixels, kPitch,
+                    kPpuRenderFlags_NewRenderer |
+                    kPpuRenderFlags_WidescreenSpriteBudget);
+    PpuSetExtraSpace(ppu, 8);  /* 16 added pixels -> two added slivers */
+    ppu->inidisp = 0x0f;
+    setup_35_sliver_case(ppu);
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
+    failures += check(!ppu->timeOver,
+                      "live 16-pixel margins admit sliver 35");
+    failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) != 0,
+                      "live widened world renders the formerly dropped slot");
+
+    ppu_reset(ppu);
+    PpuBeginDrawing(ppu, pixels, kPitch,
+                    kPpuRenderFlags_NewRenderer |
+                    kPpuRenderFlags_WidescreenSpriteBudget);
+    PpuSetExtraSpaceCentered(ppu, 8);
+    ppu->inidisp = 0x0f;
+    setup_33_sprite_case(ppu);
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
+    failures += check(ppu->rangeOver,
+                      "centered widescreen keeps native 32-sprite limit");
+
+    ppu_reset(ppu);
+    PpuBeginDrawing(ppu, pixels, kPitch,
+                    kPpuRenderFlags_NewRenderer |
+                    kPpuRenderFlags_WidescreenSpriteBudget);
+    PpuSetExtraSpace(ppu, 8);
+    ppu->inidisp = 0x0f;
+    setup_33_sprite_case(ppu);
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
+    failures += check(!ppu->rangeOver,
+                      "live 16-pixel margins admit sprite 33");
 
     /* Existing line-enhancer users rely on BG1 staying inside its authentic
      * destination viewport. New title-specific source insets must be opt-in
