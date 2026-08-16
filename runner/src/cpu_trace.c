@@ -61,6 +61,85 @@ static int g_watch_owner_overflow;
 static int g_watch_lines_this_frame;
 static int g_watch_frame_seen = -1;
 
+/* --- differential-oracle capture ---------------------------------------
+ * SNESRECOMP_ORACLE=<pc24 hex>            target function entry
+ * SNESRECOMP_ORACLE_RANGES=a:l[,a:l...]   WRAM captured at entry+exit
+ * SNESRECOMP_ORACLE_LOG=<path>            jsonl (default stderr)
+ * One record per outermost call of the target: entry and exit registers,
+ * flags byte, cycle delta, and the captured WRAM ranges as hex.  Feeds
+ * tools/oracle_diff.py: two deterministic runs (native vs interpreter,
+ * or original vs replacement) must produce identical logs.  A host
+ * boundary reset while armed emits an explicit abandoned record —
+ * never a silently truncated pair. */
+enum { kOracleMaxRanges = 24, kOracleMaxBytes = 1024 };
+
+typedef struct OracleSnap {
+    uint16 A, X, Y, S, D;
+    uint8 DB, PB, P;
+    int frame;
+    uint64_t cycles;
+    uint8_t mem[kOracleMaxBytes];
+} OracleSnap;
+
+static uint32_t g_oracle_pc24;            /* 0 = disabled */
+static WatchRange g_oracle_ranges[kOracleMaxRanges];
+static int g_oracle_range_count;
+static uint32_t g_oracle_bytes_total;
+static FILE *g_oracle_out;
+static int g_oracle_armed_depth = -1;     /* window depth at armed entry */
+static uint64_t g_oracle_calls;
+static OracleSnap g_oracle_entry;
+static int g_func_window_depth;           /* every entry/exit, always on */
+
+static void oracle_snapshot(CpuState *cpu, OracleSnap *snap) {
+    extern uint8_t g_ram[0x20000];
+    extern int snes_frame_counter;
+    snap->A = cpu->A;
+    snap->X = cpu->X;
+    snap->Y = cpu->Y;
+    snap->S = cpu->S;
+    snap->D = cpu->D;
+    snap->DB = cpu->DB;
+    snap->PB = cpu->PB;
+    snap->P = cpu->P;
+    snap->frame = snes_frame_counter;
+    snap->cycles = cpu->cycles;
+    uint32_t offset = 0;
+    for (int r = 0; r < g_oracle_range_count; r++) {
+        memcpy(snap->mem + offset, g_ram + g_oracle_ranges[r].addr,
+               g_oracle_ranges[r].len);
+        offset += g_oracle_ranges[r].len;
+    }
+}
+
+static void oracle_emit_regs(const OracleSnap *snap) {
+    fprintf(g_oracle_out,
+            "\"A\":%u,\"X\":%u,\"Y\":%u,\"S\":%u,\"D\":%u,"
+            "\"DB\":%u,\"PB\":%u,\"P\":%u,\"frame\":%d,\"mem\":\"",
+            snap->A, snap->X, snap->Y, snap->S, snap->D,
+            snap->DB, snap->PB, snap->P, snap->frame);
+    for (uint32_t i = 0; i < g_oracle_bytes_total; i++)
+        fprintf(g_oracle_out, "%02X", snap->mem[i]);
+    fputc('"', g_oracle_out);
+}
+
+static void oracle_emit_pair(CpuState *cpu, const char *outcome) {
+    OracleSnap exit_snap;
+    oracle_snapshot(cpu, &exit_snap);
+    g_oracle_calls++;
+    fprintf(g_oracle_out,
+            "{\"type\":\"oracle_call\",\"call\":%llu,"
+            "\"pc24\":\"0x%06X\",\"outcome\":\"%s\",\"entry\":{",
+            (unsigned long long)g_oracle_calls, g_oracle_pc24, outcome);
+    oracle_emit_regs(&g_oracle_entry);
+    fputs("},\"exit\":{", g_oracle_out);
+    oracle_emit_regs(&exit_snap);
+    fprintf(g_oracle_out, "},\"cycles_delta\":%llu}\n",
+            (unsigned long long)(exit_snap.cycles -
+                                 g_oracle_entry.cycles));
+    fflush(g_oracle_out);
+}
+
 static void prof_dump_at_exit(void) {
     if (!g_prof_out || !g_prof_table) return;
     for (int i = 0; i < kProfSlots; i++) {
@@ -79,14 +158,18 @@ static void prof_dump_at_exit(void) {
     g_prof_out = NULL;
 }
 
-static int watch_parse_spec(const char *spec) {
-    WatchRange parsed[kWatchMaxRanges];
+static int parse_ranges_spec(const char *spec, WatchRange *out_ranges,
+                             int max_ranges, uint32_t max_bytes,
+                             int *out_count) {
+    WatchRange parsed[kWatchMaxRanges > 32 ? kWatchMaxRanges : 32];
     int count = 0;
     uint32_t total = 0;
     const char *cursor = spec;
+    if (max_ranges > (int)(sizeof parsed / sizeof parsed[0]))
+        max_ranges = (int)(sizeof parsed / sizeof parsed[0]);
     while (cursor && *cursor) {
         while (isspace((unsigned char)*cursor)) cursor++;
-        if (!*cursor || count >= kWatchMaxRanges) return 0;
+        if (!*cursor || count >= max_ranges) return 0;
         char *end = NULL;
         unsigned long raw_addr = strtoul(cursor, &end, 16);
         if (end == cursor || raw_addr > 0x1FFFFul) return 0;
@@ -98,9 +181,9 @@ static int watch_parse_spec(const char *spec) {
             if (end == len_start) return 0;
             cursor = end;
         }
-        if (raw_len == 0 || raw_len > kWatchMaxBytes ||
+        if (raw_len == 0 || raw_len > max_bytes ||
             raw_addr + raw_len > 0x20000ul ||
-            total + (uint32_t)raw_len > kWatchMaxBytes)
+            total + (uint32_t)raw_len > max_bytes)
             return 0;
         for (int i = 0; i < count; i++) {
             uint32_t prior_end = parsed[i].addr + parsed[i].len;
@@ -120,9 +203,14 @@ static int watch_parse_spec(const char *spec) {
         if (!*cursor) return 0;
     }
     if (!count) return 0;
-    memcpy(g_watch_ranges, parsed, (size_t)count * sizeof parsed[0]);
-    g_watch_range_count = count;
+    memcpy(out_ranges, parsed, (size_t)count * sizeof parsed[0]);
+    *out_count = count;
     return 1;
+}
+
+static int watch_parse_spec(const char *spec) {
+    return parse_ranges_spec(spec, g_watch_ranges, kWatchMaxRanges,
+                             kWatchMaxBytes, &g_watch_range_count);
 }
 
 static void prof_watch_init_once(void) {
@@ -154,6 +242,35 @@ static void prof_watch_init_once(void) {
                 fprintf(stderr,
                         "[func-watch] cannot open SNESRECOMP_WATCH_LOG; disabled\n");
                 g_watch_range_count = 0;
+            }
+        }
+    }
+    const char *oracle_spec = getenv("SNESRECOMP_ORACLE");
+    if (oracle_spec && oracle_spec[0]) {
+        char *end = NULL;
+        unsigned long pc24 = strtoul(oracle_spec, &end, 16);
+        const char *ranges = getenv("SNESRECOMP_ORACLE_RANGES");
+        int ok = end != oracle_spec && pc24 <= 0xFFFFFFul && ranges &&
+                 ranges[0] &&
+                 parse_ranges_spec(ranges, g_oracle_ranges,
+                                   kOracleMaxRanges, kOracleMaxBytes,
+                                   &g_oracle_range_count);
+        if (!ok) {
+            fprintf(stderr, "[oracle] invalid SNESRECOMP_ORACLE/"
+                            "SNESRECOMP_ORACLE_RANGES; disabled\n");
+        } else {
+            const char *log_path = getenv("SNESRECOMP_ORACLE_LOG");
+            g_oracle_out = (log_path && log_path[0])
+                ? fopen(log_path, "wb") : stderr;
+            if (!g_oracle_out) {
+                fprintf(stderr,
+                        "[oracle] cannot open SNESRECOMP_ORACLE_LOG; "
+                        "disabled\n");
+            } else {
+                g_oracle_pc24 = (uint32_t)pc24;
+                g_oracle_bytes_total = 0;
+                for (int r = 0; r < g_oracle_range_count; r++)
+                    g_oracle_bytes_total += g_oracle_ranges[r].len;
             }
         }
     }
@@ -266,11 +383,26 @@ static void prof_watch_on_entry(CpuState *cpu, uint32_t pc24,
             g_watch_owner_overflow = 1;
         }
     }
+
+    if (g_oracle_pc24) {
+        if (pc24 == g_oracle_pc24 && g_oracle_armed_depth < 0) {
+            /* outermost call of the target: snapshot before its body */
+            oracle_snapshot(cpu, &g_oracle_entry);
+            g_oracle_armed_depth = g_func_window_depth;
+        }
+    }
+    g_func_window_depth++;
 }
 
 void cpu_trace_func_exit(CpuState *cpu) {
-    (void)cpu;
     prof_watch_init_once();
+    if (g_func_window_depth > 0)
+        g_func_window_depth--;
+    if (g_oracle_pc24 && g_oracle_armed_depth >= 0 &&
+        g_func_window_depth == g_oracle_armed_depth) {
+        oracle_emit_pair(cpu, "returned");
+        g_oracle_armed_depth = -1;
+    }
     if (!g_watch_range_count) return;
     watch_observe_boundary("exit");
     if (g_watch_owner_overflow)
@@ -280,7 +412,6 @@ void cpu_trace_func_exit(CpuState *cpu) {
 }
 
 void cpu_trace_func_boundary_reset(CpuState *cpu) {
-    (void)cpu;
     prof_watch_init_once();
     /* An owner still present here was abandoned by a non-local host unwind
      * (for example the frame watchdog).  We can no longer separate guest work
@@ -288,6 +419,12 @@ void cpu_trace_func_boundary_reset(CpuState *cpu) {
      * fail closed: clear the owner before observing the boundary. */
     g_watch_owner_depth = 0;
     g_watch_owner_overflow = 0;
+    if (g_oracle_pc24 && g_oracle_armed_depth >= 0) {
+        /* the armed window was abandoned mid-flight: say so explicitly */
+        oracle_emit_pair(cpu, "abandoned-host-boundary");
+        g_oracle_armed_depth = -1;
+    }
+    g_func_window_depth = 0;
     if (g_watch_range_count)
         watch_observe_boundary("host-boundary");
 }
