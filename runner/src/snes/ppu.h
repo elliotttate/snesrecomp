@@ -406,6 +406,12 @@ void ppu_runLine(Ppu* ppu, int line);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
+/* RTLS v9+ serializes the PPU's write-port/latch state separately from the
+ * historical public-register and memory blocks. */
+void ppu_saveload_internal(Ppu *ppu, SaveLoadInfo *sli);
+/* Older snapshots never carried that state.  Loading one must not inherit
+ * arbitrary values from the process/scene that happened to be active. */
+void ppu_reset_internal_after_legacy_load(Ppu *ppu);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 
 // Replace stale BG1 tilemap pixels in widened side margins before final

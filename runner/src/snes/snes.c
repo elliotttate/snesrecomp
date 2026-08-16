@@ -61,10 +61,10 @@ void snes_free(Snes* snes) {
 
 /* RTLS v5 and earlier serialized beamMasterLast between vPos and
  * apuCatchupCycles (+8 bytes). v6+ keeps it host-only (before hPos). */
-static uint32_t s_saveload_version = 7;
+static uint32_t s_saveload_version = 9;
 
 void snes_saveload_set_version(uint32_t version) {
-  s_saveload_version = version ? version : 7;
+  s_saveload_version = version ? version : 9;
 }
 
 void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
@@ -72,6 +72,13 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli) {
   apu_saveload(snes->apu, sli);
   dma_saveload(snes->dma, sli);
   ppu_saveload(snes->ppu, sli);
+  if (s_saveload_version >= 9) {
+    ppu_saveload_internal(snes->ppu, sli);
+  } else {
+    /* v4-v8 did not serialize PPU write-port/latch state.  Never let an old
+     * file inherit those values from an unrelated scene in this process. */
+    ppu_reset_internal_after_legacy_load(snes->ppu);
+  }
   cart_saveload(snes->cart, sli);
 
   if (s_saveload_version <= 5) {

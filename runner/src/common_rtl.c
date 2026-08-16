@@ -215,8 +215,10 @@ static uint64_t fp_fnv1a(const uint8_t *p, size_t n) {
  *     Older files initialize that transient serial state to idle.
  * v8: game extra chunks may append a versioned host-presentation payload.
  *     DKC1 uses this to preserve its sparse widescreen margin history;
- *     older v4-v7 snapshots still load and rebuild that cache cold. */
-#define RTL_SAV_VERSION 8u
+ *     older v4-v7 snapshots still load and rebuild that cache cold.
+ * v9: serialize the PPU's internal VRAM/CGRAM/OAM port and latch state.
+ *     v4-v8 files still load through a deterministic legacy reconcile. */
+#define RTL_SAV_VERSION 9u
 #define RTL_SAV_VERSION_MIN 4u
 
 typedef struct FileSli {

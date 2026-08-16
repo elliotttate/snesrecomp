@@ -58,6 +58,104 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
 }
 
+/* Keep this wire layout explicit.  These fields are the hidden half of the
+ * SNES PPU register interface: VRAM/CGRAM/OAM addresses, byte-pair latches,
+ * and frame/counter latches.  Saving the visible register mirrors and backing
+ * memories without them makes a resumed DMA depend on the host process's
+ * previous scene. */
+void ppu_saveload_internal(Ppu *ppu, SaveLoadInfo *sli) {
+  uint32 version[2] = {
+      'P' | 'P' << 8 | 'I' << 16 | '0' << 24,
+      38,
+  };
+  uint8_t vramIncrementOnHigh = ppu->vramIncrementOnHigh;
+  uint8_t cgramSecondWrite = ppu->cgramSecondWrite;
+  uint8_t oamInHigh = ppu->oamInHigh;
+  uint8_t oamSecondWrite = ppu->oamSecondWrite;
+  uint8_t timeOver = ppu->timeOver;
+  uint8_t rangeOver = ppu->rangeOver;
+  uint8_t evenFrame = ppu->evenFrame;
+  uint8_t frameOverscan = ppu->frameOverscan;
+  uint8_t frameInterlace = ppu->frameInterlace;
+  uint8_t hCountSecond = ppu->hCountSecond;
+  uint8_t vCountSecond = ppu->vCountSecond;
+  uint8_t countersLatched = ppu->countersLatched;
+
+  sli->func(sli, version, sizeof(version));
+  sli->func(sli, &ppu->vramPointer, sizeof(ppu->vramPointer));
+  sli->func(sli, &vramIncrementOnHigh, sizeof(vramIncrementOnHigh));
+  sli->func(sli, &ppu->vramRemapMode, sizeof(ppu->vramRemapMode));
+  sli->func(sli, &ppu->vramIncrement, sizeof(ppu->vramIncrement));
+  sli->func(sli, &ppu->vramReadBuffer, sizeof(ppu->vramReadBuffer));
+  sli->func(sli, &ppu->cgramPointer, sizeof(ppu->cgramPointer));
+  sli->func(sli, &cgramSecondWrite, sizeof(cgramSecondWrite));
+  sli->func(sli, &ppu->cgramBuffer, sizeof(ppu->cgramBuffer));
+  sli->func(sli, &ppu->oamAdr, sizeof(ppu->oamAdr));
+  sli->func(sli, &oamInHigh, sizeof(oamInHigh));
+  sli->func(sli, &oamSecondWrite, sizeof(oamSecondWrite));
+  sli->func(sli, &ppu->oamBuffer, sizeof(ppu->oamBuffer));
+  sli->func(sli, &timeOver, sizeof(timeOver));
+  sli->func(sli, &rangeOver, sizeof(rangeOver));
+  sli->func(sli, &ppu->scrollPrev, sizeof(ppu->scrollPrev));
+  sli->func(sli, &ppu->scrollPrev2, sizeof(ppu->scrollPrev2));
+  sli->func(sli, &ppu->mosaicStartLine, sizeof(ppu->mosaicStartLine));
+  sli->func(sli, &ppu->m7prev, sizeof(ppu->m7prev));
+  sli->func(sli, &ppu->m7startX, sizeof(ppu->m7startX));
+  sli->func(sli, &ppu->m7startY, sizeof(ppu->m7startY));
+  sli->func(sli, &evenFrame, sizeof(evenFrame));
+  sli->func(sli, &frameOverscan, sizeof(frameOverscan));
+  sli->func(sli, &frameInterlace, sizeof(frameInterlace));
+  sli->func(sli, &ppu->hCount, sizeof(ppu->hCount));
+  sli->func(sli, &ppu->vCount, sizeof(ppu->vCount));
+  sli->func(sli, &hCountSecond, sizeof(hCountSecond));
+  sli->func(sli, &vCountSecond, sizeof(vCountSecond));
+  sli->func(sli, &countersLatched, sizeof(countersLatched));
+
+  ppu->vramIncrementOnHigh = vramIncrementOnHigh != 0;
+  ppu->cgramSecondWrite = cgramSecondWrite != 0;
+  ppu->oamInHigh = oamInHigh != 0;
+  ppu->oamSecondWrite = oamSecondWrite != 0;
+  ppu->timeOver = timeOver != 0;
+  ppu->rangeOver = rangeOver != 0;
+  ppu->evenFrame = evenFrame != 0;
+  ppu->frameOverscan = frameOverscan != 0;
+  ppu->frameInterlace = frameInterlace != 0;
+  ppu->hCountSecond = hCountSecond != 0;
+  ppu->vCountSecond = vCountSecond != 0;
+  ppu->countersLatched = countersLatched != 0;
+}
+
+void ppu_reset_internal_after_legacy_load(Ppu *ppu) {
+  ppu->vramPointer = 0;
+  ppu->vramIncrementOnHigh = false;
+  ppu->vramRemapMode = 0;
+  ppu->vramIncrement = 1;
+  ppu->vramReadBuffer = ppu->vram[0];
+  ppu->cgramPointer = 0;
+  ppu->cgramSecondWrite = false;
+  ppu->cgramBuffer = 0;
+  ppu->oamAdr = ppu->oamaddl;
+  ppu->oamInHigh = (ppu->oamaddh & 1) != 0;
+  ppu->oamSecondWrite = false;
+  ppu->oamBuffer = 0;
+  ppu->timeOver = false;
+  ppu->rangeOver = false;
+  ppu->scrollPrev = 0;
+  ppu->scrollPrev2 = 0;
+  ppu->mosaicStartLine = 0;
+  ppu->m7prev = 0;
+  ppu->m7startX = 0;
+  ppu->m7startY = 0;
+  ppu->evenFrame = false;
+  ppu->frameOverscan = (ppu->setini & 4) != 0;
+  ppu->frameInterlace = (ppu->setini & 1) != 0;
+  ppu->hCount = 0;
+  ppu->vCount = 0;
+  ppu->hCountSecond = false;
+  ppu->vCountSecond = false;
+  ppu->countersLatched = false;
+}
+
 // Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
 // (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
 // never affects guest state. Unset/0xff = all layers (normal).
